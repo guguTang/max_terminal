@@ -1,3 +1,4 @@
+use crate::local::LOCAL_SESSION_ID;
 use crate::ssh::pty::{
     apply_terminal_state, create_terminal, query_cwd, resize_terminal, write_input, TerminalHandle,
 };
@@ -14,6 +15,10 @@ fn normalize_terminal_id(terminal_id: Option<String>) -> String {
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "main".to_string())
+}
+
+fn is_local_session(session_id: &str) -> bool {
+    session_id == LOCAL_SESSION_ID
 }
 
 async fn create_terminal_for_session(
@@ -76,6 +81,31 @@ pub async fn terminal_create(
     terminal_id: Option<String>,
     options: Option<TerminalCreateOptions>,
 ) -> Result<(), String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+    let options = options.unwrap_or(TerminalCreateOptions {
+        initial_cwd: None,
+        initial_env: HashMap::new(),
+        cols: None,
+        rows: None,
+    });
+    let cols = options.cols.unwrap_or(120).max(1);
+    let rows = options.rows.unwrap_or(40).max(1);
+
+    if is_local_session(&session_id) {
+        let mut local = state.local_terminals.lock().await;
+        local
+            .create(
+                app,
+                terminal_id,
+                cols,
+                rows,
+                options.initial_cwd,
+                options.initial_env,
+            )
+            .await?;
+        return Ok(());
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -84,21 +114,12 @@ pub async fn terminal_create(
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let terminal_id = normalize_terminal_id(terminal_id);
-    let options = options.unwrap_or(TerminalCreateOptions {
-        initial_cwd: None,
-        initial_env: HashMap::new(),
-        cols: None,
-        rows: None,
-    });
     let has_state = options
         .initial_cwd
         .as_ref()
         .map(|path| is_valid_cwd_path(path))
         .unwrap_or(false)
         || !options.initial_env.is_empty();
-    let cols = options.cols.unwrap_or(120).max(1);
-    let rows = options.rows.unwrap_or(40).max(1);
 
     let terminal = {
         let mut inner = session.lock().await;
@@ -148,6 +169,16 @@ pub async fn terminal_apply_state(
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+    let env = env.unwrap_or_default();
+
+    if is_local_session(&session_id) {
+        let mut local = state.local_terminals.lock().await;
+        return local
+            .apply_state(&terminal_id, cwd, env)
+            .await;
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -156,8 +187,6 @@ pub async fn terminal_apply_state(
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let terminal_id = normalize_terminal_id(terminal_id);
-    let env = env.unwrap_or_default();
     let cwd_for_meta = cwd.clone();
 
     let terminal = {
@@ -202,6 +231,15 @@ pub async fn terminal_get_meta(
     session_id: String,
     terminal_id: Option<String>,
 ) -> Result<TerminalMeta, String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+
+    if is_local_session(&session_id) {
+        let local = state.local_terminals.lock().await;
+        return local
+            .get_meta(&terminal_id)
+            .ok_or_else(|| "Terminal metadata not found".to_string());
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -211,7 +249,6 @@ pub async fn terminal_get_meta(
     };
 
     let inner = session.lock().await;
-    let terminal_id = normalize_terminal_id(terminal_id);
     inner
         .terminal_meta
         .get(&terminal_id)
@@ -228,6 +265,14 @@ pub async fn terminal_update_meta(
     env: Option<HashMap<String, String>>,
     unset_env: Option<Vec<String>>,
 ) -> Result<(), String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+
+    if is_local_session(&session_id) {
+        let mut local = state.local_terminals.lock().await;
+        local.update_meta(&terminal_id, cwd, env, unset_env);
+        return Ok(());
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -237,7 +282,6 @@ pub async fn terminal_update_meta(
     };
 
     let mut inner = session.lock().await;
-    let terminal_id = normalize_terminal_id(terminal_id);
     let home_path = inner.home_path.clone();
     let meta = inner
         .terminal_meta
@@ -273,6 +317,13 @@ pub async fn terminal_query_cwd(
     session_id: String,
     terminal_id: Option<String>,
 ) -> Result<String, String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+
+    if is_local_session(&session_id) {
+        let local = state.local_terminals.lock().await;
+        return local.query_cwd(&terminal_id).await;
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -281,7 +332,6 @@ pub async fn terminal_query_cwd(
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let terminal_id = normalize_terminal_id(terminal_id);
     let terminal = {
         let inner = session.lock().await;
         inner
@@ -300,6 +350,14 @@ pub async fn terminal_destroy(
     session_id: String,
     terminal_id: Option<String>,
 ) -> Result<(), String> {
+    if is_local_session(&session_id) {
+        let mut local = state.local_terminals.lock().await;
+        local
+            .destroy(terminal_id.map(|id| normalize_terminal_id(Some(id))))
+            .await;
+        return Ok(());
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -325,12 +383,26 @@ pub async fn terminal_destroy(
 }
 
 #[tauri::command]
+pub async fn terminal_destroy_all_local(state: State<'_, AppState>) -> Result<(), String> {
+    let mut local = state.local_terminals.lock().await;
+    local.destroy(None).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn terminal_input(
     state: State<'_, AppState>,
     session_id: String,
     data: String,
     terminal_id: Option<String>,
 ) -> Result<(), String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+
+    if is_local_session(&session_id) {
+        let local = state.local_terminals.lock().await;
+        return local.write_input(&terminal_id, &data).await;
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -339,7 +411,6 @@ pub async fn terminal_input(
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let terminal_id = normalize_terminal_id(terminal_id);
     let terminal = {
         let inner = session.lock().await;
         inner
@@ -362,6 +433,13 @@ pub async fn terminal_resize(
     rows: u32,
     terminal_id: Option<String>,
 ) -> Result<(), String> {
+    let terminal_id = normalize_terminal_id(terminal_id);
+
+    if is_local_session(&session_id) {
+        let local = state.local_terminals.lock().await;
+        return local.resize(&terminal_id, cols, rows).await;
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -370,7 +448,6 @@ pub async fn terminal_resize(
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let terminal_id = normalize_terminal_id(terminal_id);
     let terminal = {
         let inner = session.lock().await;
         inner

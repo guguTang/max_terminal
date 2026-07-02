@@ -1,16 +1,28 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { RotateCcw, Server, Laptop, X, Eraser } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ConsoleDockLayout } from "./components/ConsoleDockLayout";
 import { DockLayout } from "./components/DockLayout";
 import { TerminalOutputBridge } from "./components/TerminalOutputBridge";
 import { ConnectionList } from "./components/ConnectionList";
 import { TransferDrawer } from "./components/TransferDrawer";
 import { TransferRail } from "./components/TransferRail";
-import { getDockApi, LAYOUT_STORAGE_KEY, resetLayout } from "./layout/dockApi";
+import {
+  CONSOLE_LAYOUT_STORAGE_KEY,
+  getDockApi,
+  LAYOUT_STORAGE_KEY,
+  resetConsoleLayout,
+  resetLayout,
+  saveConsoleLayout,
+  saveLayout,
+} from "./layout/dockApi";
 import { useSessionStore } from "./stores/sessionStore";
 import { useConnectionStore } from "./stores/connectionStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useTerminalTitleStore } from "./stores/terminalTitleStore";
+import { destroyAllLocalTerminals, useLocalConsoleStore } from "./stores/localConsoleStore";
+import { useAppPersistence } from "./hooks/useAppPersistence";
+import { clearPersistedAppState } from "./lib/appStatePersistence";
 
 import { useTransferPolling } from "./hooks/useTransferPolling";
 
@@ -29,28 +41,46 @@ function App() {
   } = useSessionStore();
   const connections = useConnectionStore((s) => s.connections);
   const [layoutKey, setLayoutKey] = useState(0);
+  const [consoleLayoutKey, setConsoleLayoutKey] = useState(0);
   const [resetFeedback, setResetFeedback] = useState(false);
   const [mode, setMode] = useState<"ssh" | "console">("ssh");
   const [transferOpen, setTransferOpen] = useState(false);
+  const setLocalConsoleReady = useLocalConsoleStore((s) => s.setReady);
 
-  useEffect(() => {
-    const handleBeforeUnload = () => {
+  const saveCurrentDockLayout = () => {
+    const api = getDockApi();
+    if (!api) return;
+    if (mode === "console") {
+      saveConsoleLayout(api);
+    } else {
+      saveLayout(api);
+    }
+  };
+
+  useAppPersistence({
+    mode,
+    transferOpen,
+    setMode,
+    setTransferOpen,
+    setLocalConsoleReady,
+    saveCurrentDockLayout,
+    onClose: () => {
       void useSessionStore.getState().disconnectAll();
-    };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      void disconnectAll();
-    };
-  }, [disconnectAll]);
+      void destroyAllLocalTerminals();
+    },
+  });
 
   const handleResetLayout = () => {
     const api = getDockApi();
     if (api) {
-      resetLayout(api);
+      if (mode === "console") {
+        resetConsoleLayout(api);
+      } else {
+        resetLayout(api);
+      }
+    } else if (mode === "console") {
+      localStorage.removeItem(CONSOLE_LAYOUT_STORAGE_KEY);
+      setConsoleLayoutKey((k) => k + 1);
     } else {
       localStorage.removeItem(LAYOUT_STORAGE_KEY);
       setLayoutKey((k) => k + 1);
@@ -64,6 +94,7 @@ function App() {
     useWorkspaceStore.setState({ snapshots: {} });
     useTerminalTitleStore.setState({ titlesByConnection: {} });
     localStorage.removeItem(LAYOUT_STORAGE_KEY);
+    await clearPersistedAppState();
     const api = getDockApi();
     if (api) {
       resetLayout(api);
@@ -72,6 +103,18 @@ function App() {
     }
     setResetFeedback(true);
     window.setTimeout(() => setResetFeedback(false), 1500);
+  };
+
+  const handleSwitchToSsh = () => {
+    saveCurrentDockLayout();
+    setMode("ssh");
+    showSshList();
+  };
+
+  const handleSwitchToConsole = () => {
+    saveCurrentDockLayout();
+    setLocalConsoleReady(true);
+    setMode("console");
   };
 
   const handleDragMouseDown = (event: React.MouseEvent<HTMLElement>) => {
@@ -102,10 +145,7 @@ function App() {
         <nav className="flex items-center gap-1 shrink-0 app-no-drag">
           <button
             type="button"
-            onClick={() => {
-              setMode("ssh");
-              showSshList();
-            }}
+            onClick={handleSwitchToSsh}
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs ${
               mode === "ssh" && sshViewMode === "list"
                 ? "bg-zinc-800 text-zinc-100"
@@ -117,7 +157,7 @@ function App() {
           </button>
           <button
             type="button"
-            onClick={() => setMode("console")}
+            onClick={handleSwitchToConsole}
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs ${
               mode === "console"
                 ? "bg-zinc-800 text-zinc-100"
@@ -204,14 +244,12 @@ function App() {
       <div className="flex-1 min-h-0">
         <div className="h-full w-full flex min-h-0">
           <div className="flex-1 min-h-0">
-            {mode === "ssh" && sshViewMode === "list" ? (
+            {mode === "console" ? (
+              <ConsoleDockLayout layoutKey={consoleLayoutKey} />
+            ) : mode === "ssh" && sshViewMode === "list" ? (
               <ConnectionList />
-            ) : mode === "ssh" ? (
-              <DockLayout layoutKey={layoutKey} />
             ) : (
-              <div className="h-full flex items-center justify-center text-sm text-zinc-500">
-                本机 Console 即将支持
-              </div>
+              <DockLayout layoutKey={layoutKey} />
             )}
           </div>
           {mode === "ssh" && sshViewMode === "session" && (

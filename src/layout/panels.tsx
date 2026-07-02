@@ -49,11 +49,13 @@ function TerminalPanel(
   props: IDockviewPanelProps<{
     terminalId?: string;
     connectionId?: string;
+    workspaceKind?: "local";
     initialCwd?: string;
     initialEnv?: Record<string, string>;
   }>,
 ) {
   const terminalId = props.params?.terminalId ?? "main";
+  const isLocal = props.params?.workspaceKind === "local";
   const activeConnectionId = useSessionStore((s) => s.connectionId);
   const sessions = useSessionStore((s) => s.sessions);
   const boundConnectionId = props.params?.connectionId ?? activeConnectionId ?? undefined;
@@ -62,6 +64,7 @@ function TerminalPanel(
   return (
     <div className="h-full min-h-0 overflow-hidden">
       <Terminal
+        kind={isLocal ? "local" : "ssh"}
         terminalId={terminalId}
         sshSessionId={sshSessionId}
         initialCwd={props.params?.initialCwd}

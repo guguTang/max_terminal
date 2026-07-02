@@ -1,3 +1,4 @@
+use crate::db::app_state::init_app_state_table;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -37,6 +38,7 @@ pub fn init_db(path: &Path) -> SqliteResult<Connection> {
         )",
         [],
     )?;
+    init_app_state_table(&conn)?;
     Ok(conn)
 }
 

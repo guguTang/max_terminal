@@ -4,12 +4,19 @@ import type {
   GetTabContextMenuItemsParams,
   IDockviewPanel,
 } from "dockview";
-import { duplicateTerminal } from "./dockApi";
+import { duplicateConsoleTerminal, duplicateTerminal } from "./dockApi";
 
 export const DEFAULT_TERMINAL_ID = "main";
 
 export function isTerminalPanel(panel: Pick<IDockviewPanel, "id">) {
   return panel.id.startsWith("terminal");
+}
+
+export function isLocalTerminalPanel(panel: IDockviewPanel) {
+  return (
+    isTerminalPanel(panel) &&
+    (panel.params as { workspaceKind?: string } | undefined)?.workspaceKind === "local"
+  );
 }
 
 export function getTerminalIdFromPanel(panel: IDockviewPanel) {
@@ -34,6 +41,30 @@ export function getTerminalTabContextMenuItems({
       label: "复制终端",
       action: () => {
         void duplicateTerminal(api, terminalId);
+      },
+    },
+    "separator",
+    "close",
+    "closeOthers",
+    "closeAll",
+  ] satisfies (BuiltInContextMenuItem | ContextMenuItemConfig)[];
+}
+
+export function getConsoleTerminalTabContextMenuItems({
+  panel,
+  api,
+}: GetTabContextMenuItemsParams) {
+  if (!isTerminalPanel(panel)) {
+    return ["close", "separator", "closeOthers", "closeAll"] satisfies BuiltInContextMenuItem[];
+  }
+
+  const terminalId = getTerminalIdFromPanel(panel);
+
+  return [
+    {
+      label: "复制终端",
+      action: () => {
+        void duplicateConsoleTerminal(api, terminalId);
       },
     },
     "separator",

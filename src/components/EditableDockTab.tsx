@@ -1,5 +1,6 @@
 import React from "react";
 import type { IDockviewPanelHeaderProps } from "dockview";
+import { LOCAL_WORKSPACE_ID } from "../stores/localConsoleStore";
 import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalTitleStore } from "../stores/terminalTitleStore";
 
@@ -116,10 +117,16 @@ export function EditableDockTab(props: EditableDockTabProps) {
     if (next) {
       api.setTitle(next);
       if (terminalTab) {
-        const connectionId = useSessionStore.getState().connectionId;
-        const terminalId = String((props.params as { terminalId?: string } | undefined)?.terminalId ?? "main");
-        if (connectionId) {
-          useTerminalTitleStore.getState().setTitle(connectionId, terminalId, next);
+        const params = props.params as
+          | { terminalId?: string; workspaceKind?: string }
+          | undefined;
+        const terminalId = String(params?.terminalId ?? "main");
+        const workspaceId =
+          params?.workspaceKind === "local"
+            ? LOCAL_WORKSPACE_ID
+            : useSessionStore.getState().connectionId;
+        if (workspaceId) {
+          useTerminalTitleStore.getState().setTitle(workspaceId, terminalId, next);
         }
       }
     }

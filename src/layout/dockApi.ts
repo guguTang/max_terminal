@@ -1,5 +1,6 @@
 import type { DockviewApi } from "dockview";
 import { invoke } from "@tauri-apps/api/core";
+import { LOCAL_SESSION_ID, LOCAL_WORKSPACE_ID } from "../stores/localConsoleStore";
 import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import { useTerminalTitleStore } from "../stores/terminalTitleStore";
@@ -655,3 +656,160 @@ export function syncRenamedPathInEditors(
     useWorkspaceStore.getState().setSelectedFile(connectionId, newPath);
   }
 }
+
+/** Console 模式独立布局存储 */
+export const CONSOLE_LAYOUT_STORAGE_KEY = "max-terminal-console-layout-v1";
+
+const CONSOLE_TERMINAL_PANEL = {
+  id: "terminal",
+  component: "terminal",
+  title: "本机终端",
+  minimumHeight: 120,
+  initialHeight: 280,
+} as const;
+
+function isValidLocalCwdPath(path?: string) {
+  if (!path) return false;
+  const trimmed = path.trim();
+  if (!trimmed || trimmed.includes("$") || trimmed.includes('"') || trimmed.includes("`")) {
+    return false;
+  }
+  if (trimmed.startsWith("/") || trimmed.startsWith("~")) return true;
+  return /^[A-Za-z]:[\\/]/.test(trimmed);
+}
+
+function defaultConsoleTerminalTitle(terminalId: string, sourceTerminalId?: string) {
+  if (terminalId === DEFAULT_TERMINAL_ID) return "本机终端";
+  const suffix = terminalId.replace("term-", "");
+  return sourceTerminalId ? `本机终端 ${suffix} (副本)` : `本机终端 ${suffix}`;
+}
+
+function resolveConsoleTerminalTitle(terminalId: string, sourceTerminalId?: string) {
+  return (
+    useTerminalTitleStore.getState().getTitle(LOCAL_WORKSPACE_ID, terminalId) ??
+    defaultConsoleTerminalTitle(terminalId, sourceTerminalId)
+  );
+}
+
+function consoleTerminalParams(terminalId: string, extra?: Record<string, unknown>) {
+  return {
+    terminalId,
+    workspaceKind: "local" as const,
+    ...extra,
+  };
+}
+
+function syncConsoleTerminalTitles(api: DockviewApi) {
+  const titleStore = useTerminalTitleStore.getState();
+  for (const panel of api.panels) {
+    if (!panel.id.startsWith("terminal")) continue;
+    const terminalId =
+      ((panel.params as { terminalId?: string } | undefined)?.terminalId ?? DEFAULT_TERMINAL_ID);
+    const title =
+      titleStore.getTitle(LOCAL_WORKSPACE_ID, terminalId) ??
+      defaultConsoleTerminalTitle(terminalId);
+    panel.api.setTitle(title);
+  }
+}
+
+export function createConsoleDefaultLayout(api: DockviewApi) {
+  api.clear();
+  const { terminalHeight } = getInitialPanelSizes(api);
+
+  api.addPanel({
+    ...CONSOLE_TERMINAL_PANEL,
+    title: resolveConsoleTerminalTitle(DEFAULT_TERMINAL_ID),
+    params: consoleTerminalParams(DEFAULT_TERMINAL_ID),
+    initialHeight: terminalHeight,
+  });
+
+  dockTerminalFullWidth(api, terminalHeight);
+}
+
+export function loadConsoleSavedLayout(api: DockviewApi): boolean {
+  const raw = localStorage.getItem(CONSOLE_LAYOUT_STORAGE_KEY);
+  if (!raw) return false;
+  try {
+    api.fromJSON(JSON.parse(raw));
+    syncConsoleTerminalTitles(api);
+    return true;
+  } catch {
+    localStorage.removeItem(CONSOLE_LAYOUT_STORAGE_KEY);
+    return false;
+  }
+}
+
+export function saveConsoleLayout(api: DockviewApi) {
+  localStorage.setItem(CONSOLE_LAYOUT_STORAGE_KEY, JSON.stringify(api.toJSON()));
+}
+
+export function resetConsoleLayout(api: DockviewApi) {
+  localStorage.removeItem(CONSOLE_LAYOUT_STORAGE_KEY);
+  createConsoleDefaultLayout(api);
+  saveConsoleLayout(api);
+}
+
+export function addConsoleTerminal(
+  api: DockviewApi,
+  sourceTerminalId?: string,
+  cloneMeta?: TerminalMeta,
+) {
+  const terminalId = nextTerminalId(api);
+  const existingTerminal =
+    api.panels.find((p) => p.id.startsWith("terminal")) ?? api.getPanel("terminal");
+
+  const panel = api.addPanel({
+    id: terminalPanelId(terminalId),
+    component: "terminal",
+    title: resolveConsoleTerminalTitle(terminalId, sourceTerminalId),
+    params: consoleTerminalParams(terminalId, {
+      initialCwd: cloneMeta?.cwd,
+      initialEnv: cloneMeta?.env,
+    }),
+    position: existingTerminal
+      ? { referencePanel: existingTerminal.id, direction: "within" }
+      : undefined,
+  });
+  panel.api.setActive();
+}
+
+export async function duplicateConsoleTerminal(
+  api: DockviewApi,
+  sourceTerminalId?: string,
+) {
+  const source = sourceTerminalId ?? getActiveTerminalId(api);
+  const cached = useTerminalMetaStore.getState().getMeta(LOCAL_SESSION_ID, source);
+  let cwd = cached?.cwd;
+  let env = cached?.env ?? {};
+
+  try {
+    const queried = await invoke<string>("terminal_query_cwd", {
+      sessionId: LOCAL_SESSION_ID,
+      terminalId: source,
+    });
+    if (isValidLocalCwdPath(queried)) {
+      cwd = queried;
+      useTerminalMetaStore.getState().setCwd(LOCAL_SESSION_ID, source, queried);
+    }
+  } catch {
+    // ignore, fallback below
+  }
+
+  try {
+    const storedMeta = await invoke<TerminalMeta>("terminal_get_meta", {
+      sessionId: LOCAL_SESSION_ID,
+      terminalId: source,
+    });
+    env = { ...storedMeta.env, ...env };
+    if (!isValidLocalCwdPath(cwd) && isValidLocalCwdPath(storedMeta.cwd)) {
+      cwd = storedMeta.cwd;
+    }
+  } catch {
+    // ignore, fallback below
+  }
+
+  if (!isValidLocalCwdPath(cwd)) return;
+
+  addConsoleTerminal(api, source, { cwd: cwd!, env });
+}
+

@@ -30,3 +30,4 @@ tokio-util = { version = "0.7", features = ["compat"] }
 base64 = "0.22"
 tar = "0.4"
 flate2 = "1"
+portable-pty = "0.8"

@@ -38,6 +38,8 @@ interface TerminalOutputState {
   clearTerminal: (sessionId: string, terminalId: string) => void;
   clearSession: (sessionId: string) => void;
   clearAll: () => void;
+  exportBuffers: () => Record<string, string>;
+  hydrate: (buffers: Record<string, string>) => void;
 }
 
 export const useTerminalOutputStore = create<TerminalOutputState>((set, get) => ({
@@ -95,4 +97,11 @@ export const useTerminalOutputStore = create<TerminalOutputState>((set, get) => 
     }
     set({ buffers: {} });
   },
+
+  exportBuffers: () => get().buffers,
+
+  hydrate: (buffers: Record<string, string>) =>
+    set({
+      buffers: { ...buffers },
+    }),
 }));

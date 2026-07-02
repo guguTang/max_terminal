@@ -114,6 +114,10 @@ export function DockLayout({ layoutKey }: DockLayoutProps) {
   useEffect(() => {
     return () => {
       if (saveTimer) clearTimeout(saveTimer);
+      const api = apiRef.current;
+      if (api) {
+        saveLayout(api);
+      }
       setDockApi(null);
     };
   }, []);
