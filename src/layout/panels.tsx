@@ -48,13 +48,16 @@ function EditorPanel(props: IDockviewPanelProps<{ filePath: string }>) {
 function TerminalPanel(
   props: IDockviewPanelProps<{
     terminalId?: string;
+    connectionId?: string;
     initialCwd?: string;
     initialEnv?: Record<string, string>;
   }>,
 ) {
   const terminalId = props.params?.terminalId ?? "main";
-  const activeSessionId = useSessionStore((s) => s.sessionId);
-  const sshSessionId = activeSessionId ?? undefined;
+  const activeConnectionId = useSessionStore((s) => s.connectionId);
+  const sessions = useSessionStore((s) => s.sessions);
+  const boundConnectionId = props.params?.connectionId ?? activeConnectionId ?? undefined;
+  const sshSessionId = sessions.find((item) => item.connectionId === boundConnectionId)?.sessionId;
 
   return (
     <div className="h-full min-h-0 overflow-hidden">

@@ -1,0 +1,65 @@
+---
+description: Max Terminal 架构与实现注意事项（SSH 多会话、终端、传输、工作区）
+alwaysApply: true
+---
+
+# Max Terminal 开发注意事项
+
+## SSH 多会话与标签切换
+
+- 顶部 SSH 标签 = `sessionStore.sessions`，每个 `connectionId` 对应一个后端 `sessionId`。
+- 切换连接走 `activateSession` → `DockLayout` 监听 `connectionId` → `switchConnectionWorkspace`。
+- **不要**在 `activateSession` 里重复调用 `switchConnectionWorkspace`（会与 DockLayout 双触发）。
+- `connectBackground(connectionId)`：后台建连、**不切换**当前 UI；用于「传输到另一 SSH」等场景。不要替换已激活连接的 `sessionId`。
+- 跨远程传输 API 用 `destConnectionId`；后端 `get_or_connect_session_for_connection` 可按连接自动建连。
+
+## 工作区快照（切换后保持状态）
+
+- 快照在 `workspaceStore`：`dockJson`、`fileTreePath`、`selectedFile`、`terminalRuntimeById`。
+- 切换前：`captureTerminalRuntimeForConnection` + `captureConnectionWorkspace`。
+- 切换后：`restoreConnectionWorkspace` → `api.fromJSON` + `stampTerminalConnectionId`。
+- 文件树路径：用 effect cleanup 按 `connectionId` 写回，避免切换时把 A 的路径误写到 B。
+- `RemoteFileTree` 的 `key={connectionId}` 会 remount；目录状态靠 `fileTreePath` 快照恢复，展开状态不持久化。
+
+## 终端 PTY 生命周期（重要）
+
+- **切换 SSH 时 PTY 必须保留**，切回后复用 + 回放 `terminalOutputStore` 缓冲，不能重新登录。
+- `terminal_create` 后端已幂等：PTY 存在则直接 `Ok(())`。
+- **`Terminal.tsx` 卸载时不要 `terminal_destroy`**；只销毁 xterm 视图。
+- **`onDidRemovePanel`**：`fromJSON` 切换布局会临时移除面板，必须：
+  1. `if (isWorkspaceSwitching()) return` — 不销毁 PTY、不清缓冲
+  2. 用面板 `params.connectionId` 解析 `sessionId`，**禁止**用当前激活的 `sessionId`
+- 仅在这些场景销毁 PTY：用户关闭终端标签（`onDidRemovePanel` 非切换中）、`disconnect` / `disconnectAll`。
+- 终端面板 `params` 必须带 `connectionId`；`TerminalPanel` 用 `params.connectionId` 查 `sessions` 得 `sessionId`，**禁止**绑定全局 `sessionId`。
+- `workspaceSwitching` 在 `fromJSON` 完成后再延迟清除（rAF + timeout），避免竞态误销毁。
+
+## SSH 连接架构
+
+- 双连接：`sftp_handle`（SFTP/exec）+ `terminal_handle`（终端），避免 `MaxSessions` / `ConnectFailed`。
+- `terminal_io_lock` 串行开终端通道；`create_terminal_for_session` 失败可重连终端链路并重试。
+
+## 文件夹压缩传输
+
+- **禁止依赖远程 `tar`/shell**（纯 SFTP/chroot 环境会失败）。
+- 使用 `archive_sftp.rs`：SFTP 读目录 → 本地 `tar`+`flate2` 打包；解压通过 SFTP 写文件。
+- 流程：
+  - 下载：SFTP 打包到本地 archive → 本地解压
+  - 上传：本地 tar → 上传 → `extract_local_tar_gz_to_remote_dir`（用本地 archive，无需再从远程读回）
+  - 跨远程：源 SFTP 打包 → 上传到目标 → SFTP 解压
+- 单文件不走压缩流程；`compress` 参数仅目录有效。
+
+## 传输到另一 SSH（UI）
+
+- 目标列表来自 `connectionStore.connections`（排除当前），不要求目标已连接。
+- 选目标后 `connectBackground` 建连供 `RemotePathPicker` 浏览。
+- 菜单项始终显示；无其他连接时灰色提示。
+
+## 常用文件
+
+| 区域 | 路径 |
+|------|------|
+| 工作区切换 | `src/layout/dockApi.ts`, `src/components/DockLayout.tsx` |
+| 会话 | `src/stores/sessionStore.ts`, `src/stores/workspaceStore.ts` |
+| 终端 | `src/components/Terminal.tsx`, `src/layout/panels.tsx` |
+| SFTP/传输 | `src-tauri/src/ssh/sftp.rs`, `archive_sftp.rs`, `archive_transfer.rs` |
+| 命令 | `src-tauri/src/commands/sftp.rs`, `terminal.rs` |

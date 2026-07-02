@@ -26,6 +26,7 @@ interface SessionState {
   selectedFile: string | null;
   connectingId: string | null;
   connect: (connectionId: string) => Promise<void>;
+  connectBackground: (connectionId: string) => Promise<SshSessionItem>;
   activateSession: (connectionId: string) => void;
   showSshList: () => void;
   disconnect: (connectionId?: string) => Promise<void>;
@@ -64,18 +65,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   connect: async (connectionId) => {
     const existing = get().sessions.find((s) => s.connectionId === connectionId);
     if (existing) {
-      set({
-        activeSessionId: existing.sessionId,
-        sessionId: existing.sessionId,
-        connectionId: existing.connectionId,
-        homePath: existing.homePath,
-        connected: true,
-        connecting: false,
-        connectingId: null,
-        error: null,
-        selectedFile: selectedFileForConnection(connectionId),
-        sshViewMode: "session",
-      });
+      get().activateSession(connectionId);
       return;
     }
 
@@ -112,18 +102,59 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
+  connectBackground: async (connectionId) => {
+    const existing = get().sessions.find((s) => s.connectionId === connectionId);
+    if (existing) return existing;
+
+    const result = await invoke<ConnectResult>("connect_ssh", { connectionId });
+    const item: SshSessionItem = {
+      sessionId: result.sessionId,
+      connectionId: result.connectionId,
+      homePath: result.homePath,
+    };
+    set({
+      sessions: [
+        ...get().sessions.filter((s) => s.connectionId !== result.connectionId),
+        item,
+      ],
+    });
+    return item;
+  },
+
   activateSession: (connectionId) => {
     const target = get().sessions.find((s) => s.connectionId === connectionId);
     if (!target) return;
+
+    const prevConnectionId = get().connectionId;
+    if (prevConnectionId === connectionId) {
+      set({
+        activeSessionId: target.sessionId,
+        sessionId: target.sessionId,
+        connectionId: target.connectionId,
+        homePath: target.homePath,
+        connected: true,
+        selectedFile: selectedFileForConnection(connectionId),
+        sshViewMode: "session",
+        error: null,
+      });
+      return;
+    }
+
+    void import("../layout/dockApi").then(({ setWorkspaceSwitching }) => {
+      setWorkspaceSwitching(true);
+    });
+
     set({
       activeSessionId: target.sessionId,
       sessionId: target.sessionId,
       connectionId: target.connectionId,
       homePath: target.homePath,
       connected: true,
+      connecting: false,
+      connectingId: null,
+      error: null,
       selectedFile: selectedFileForConnection(connectionId),
       sshViewMode: "session",
-      error: null,
     });
   },
 

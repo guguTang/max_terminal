@@ -131,6 +131,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   capture: (api, connectionId) => {
     const current = get().snapshots[connectionId];
+    const fileTreePath = get().getFileTreePath(connectionId) ?? current?.fileTreePath ?? null;
     const selectedFile = useSessionStore.getState().connectionId === connectionId
       ? useSessionStore.getState().selectedFile
       : current?.selectedFile ?? null;
@@ -141,7 +142,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         ...state.snapshots,
         [connectionId]: {
           dockJson: api.toJSON(),
-          fileTreePath: current?.fileTreePath ?? null,
+          fileTreePath,
           selectedFile,
           terminalRuntimeById: current?.terminalRuntimeById ?? {},
         },

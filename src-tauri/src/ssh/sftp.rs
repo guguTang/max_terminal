@@ -375,7 +375,7 @@ where
     Ok(total_bytes)
 }
 
-fn join_ui_path(dir: &str, name: &str) -> String {
+pub(crate) fn join_ui_path(dir: &str, name: &str) -> String {
     if dir == "/" {
         format!("/{name}")
     } else {
@@ -397,7 +397,7 @@ pub(crate) async fn remote_path_is_dir(session: &SharedSession, path: &str) -> R
     Ok(meta.file_type() == FileType::Dir)
 }
 
-async fn remote_path_total_bytes(
+pub(crate) async fn remote_path_total_bytes(
     session: &SharedSession,
     path: &str,
     is_dir: bool,

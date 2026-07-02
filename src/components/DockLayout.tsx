@@ -9,12 +9,15 @@ import {
   captureConnectionWorkspace,
   createDefaultLayout,
   dockTerminalFullWidthAfterConnect,
+  isWorkspaceSwitching,
   loadSavedLayout,
   saveLayout,
   setDockApi,
+  setWorkspaceSwitching,
   switchConnectionWorkspace,
   syncWorkspaceWithSession,
 } from "../layout/dockApi";
+import { getTerminalIdFromPanel, isTerminalPanel } from "../layout/terminalDock";
 import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import { useTerminalOutputStore } from "../stores/terminalOutputStore";
@@ -58,16 +61,27 @@ export function DockLayout({ layoutKey }: DockLayoutProps) {
     syncWorkspaceWithSession(event.api);
     event.api.onDidLayoutChange(() => scheduleSave(event.api));
     event.api.onDidRemovePanel((panel) => {
-      if (!panel.id.startsWith("terminal")) return;
-      const terminalId =
-        ((panel.params as { terminalId?: string } | undefined)?.terminalId ?? "main");
-      const { sessionId, connectionId } = useSessionStore.getState();
-      if (!sessionId || !connectionId) return;
-      useTerminalMetaStore.getState().clearTerminal(sessionId, terminalId);
-      useTerminalOutputStore.getState().clearTerminal(sessionId, terminalId);
-      useTerminalTitleStore.getState().removeTerminal(connectionId, terminalId);
-      useWorkspaceStore.getState().removeTerminalRuntime(connectionId, terminalId);
-      void invoke("terminal_destroy", { sessionId, terminalId }).catch(() => {});
+      if (!isTerminalPanel(panel)) return;
+      // 切换 SSH 工作区时 fromJSON 会临时移除面板，不能销毁后台 PTY。
+      if (isWorkspaceSwitching()) return;
+
+      const terminalId = getTerminalIdFromPanel(panel);
+      const panelParams = panel.params as { connectionId?: string } | undefined;
+      const panelConnectionId =
+        panelParams?.connectionId ?? useSessionStore.getState().connectionId;
+      if (!panelConnectionId) return;
+      const session = useSessionStore
+        .getState()
+        .sessions.find((item) => item.connectionId === panelConnectionId);
+      if (!session) return;
+
+      useTerminalMetaStore.getState().clearTerminal(session.sessionId, terminalId);
+      useTerminalOutputStore.getState().clearTerminal(session.sessionId, terminalId);
+      useTerminalTitleStore.getState().removeTerminal(panelConnectionId, terminalId);
+      useWorkspaceStore.getState().removeTerminalRuntime(panelConnectionId, terminalId);
+      void invoke("terminal_destroy", { sessionId: session.sessionId, terminalId }).catch(
+        () => {},
+      );
     });
   }, []);
 
@@ -84,8 +98,11 @@ export function DockLayout({ layoutKey }: DockLayoutProps) {
 
     const prevConnectionId = prevConnectionIdRef.current;
     if (prevConnectionId !== connectionId) {
-      switchConnectionWorkspace(api, prevConnectionId, connectionId);
+      void switchConnectionWorkspace(api, prevConnectionId, connectionId).catch(() => {
+        setWorkspaceSwitching(false);
+      });
       prevConnectionIdRef.current = connectionId;
+      return;
     }
 
     window.setTimeout(() => dockTerminalFullWidthAfterConnect(api), 80);

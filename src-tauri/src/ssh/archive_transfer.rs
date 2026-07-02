@@ -1,14 +1,15 @@
-use crate::ssh::exec::{run_remote_command, shell_quote};
+use crate::ssh::archive_sftp::{
+    create_local_tar_gz_from_remote_dir, extract_local_tar_gz_to_remote_dir, temp_local_archive,
+};
 use crate::ssh::session::SharedSession;
 use crate::ssh::sftp::{
-    copy_remote_to_remote_with_progress, download_remote_path_with_progress, remove_path,
-    remote_path_is_dir, ui_to_sftp, upload_local_path_with_progress, TransferProgress,
+    join_ui_path, remove_path, remote_path_is_dir, upload_local_path_with_progress,
+    TransferProgress,
 };
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use tokio::process::Command;
-use uuid::Uuid;
 
 fn report_phase<F>(report: &mut F, phase: &'static str) -> Result<()>
 where
@@ -34,14 +35,6 @@ fn split_parent_name(path: &str) -> (String, String) {
         trimmed[..idx].to_string(),
         trimmed[idx + 1..].to_string(),
     )
-}
-
-fn join_ui_path(dir: &str, name: &str) -> String {
-    if dir == "/" {
-        format!("/{name}")
-    } else {
-        format!("{}/{}", dir.trim_end_matches('/'), name)
-    }
 }
 
 async fn local_tar_create(source_dir: &str, archive_path: &Path) -> Result<()> {
@@ -90,48 +83,8 @@ async fn local_tar_extract(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn remote_tar_create(session: &SharedSession, source_path: &str, archive_path: &str) -> Result<()> {
-    let (parent, name) = split_parent_name(source_path);
-    if name.is_empty() {
-        return Err(anyhow!("Invalid remote directory path"));
-    }
-    let cmd = format!(
-        "tar czf {} -C {} {}",
-        shell_quote(archive_path),
-        shell_quote(&parent),
-        shell_quote(&name)
-    );
-    let code = run_remote_command(session, &cmd).await?;
-    if code != 0 {
-        return Err(anyhow!("Remote tar compression failed (exit {code})"));
-    }
-    Ok(())
-}
-
-async fn remote_tar_extract(session: &SharedSession, archive_path: &str, dest_dir: &str) -> Result<()> {
-    let cmd = format!(
-        "mkdir -p {} && tar xzf {} -C {}",
-        shell_quote(dest_dir),
-        shell_quote(archive_path),
-        shell_quote(dest_dir)
-    );
-    let code = run_remote_command(session, &cmd).await?;
-    if code != 0 {
-        return Err(anyhow!("Remote tar extraction failed (exit {code})"));
-    }
-    Ok(())
-}
-
 async fn remote_remove_file(session: &SharedSession, path: &str) -> Result<()> {
     remove_path(session, path, false).await
-}
-
-fn temp_local_archive() -> PathBuf {
-    std::env::temp_dir().join(format!("mx-txfer-{}.tar.gz", Uuid::new_v4()))
-}
-
-fn temp_remote_archive() -> String {
-    format!("/tmp/mx-txfer-{}.tar.gz", Uuid::new_v4())
 }
 
 pub async fn upload_directory_compressed<F>(
@@ -152,8 +105,7 @@ where
     }
 
     let local_archive = temp_local_archive();
-    let remote_archive = join_ui_path(remote_dir, &format!("{name}.tar.gz"));
-    let remote_target_dir = join_ui_path(remote_dir, &name);
+    let remote_archive = join_ui_path(remote_dir, &format!(".mx-txfer-{name}.tar.gz"));
 
     report_phase(&mut report, "compressing")?;
     ensure_not_cancelled(cancel)?;
@@ -176,8 +128,7 @@ where
 
     report_phase(&mut report, "extracting")?;
     ensure_not_cancelled(cancel)?;
-    let (parent, _) = split_parent_name(&remote_archive);
-    remote_tar_extract(session, &remote_archive, &parent).await?;
+    extract_local_tar_gz_to_remote_dir(session, &local_archive, remote_dir, cancel).await?;
 
     report_phase(&mut report, "cleaning")?;
     let _ = remote_remove_file(session, &remote_archive).await;
@@ -189,7 +140,6 @@ where
         total_bytes: Some(total),
     })?;
 
-    let _ = remote_target_dir;
     Ok(total)
 }
 
@@ -210,24 +160,20 @@ where
         return Err(anyhow!("Invalid remote directory path"));
     }
 
-    let remote_archive = temp_remote_archive();
     let local_archive = temp_local_archive();
-    let local_target_dir = join_ui_path(local_parent, &name);
 
     report_phase(&mut report, "compressing")?;
     ensure_not_cancelled(cancel)?;
-    remote_tar_create(session, remote_dir, &remote_archive).await?;
-
-    let total = download_remote_path_with_progress(
+    let _archive_size = create_local_tar_gz_from_remote_dir(
         session,
-        &remote_archive,
-        local_archive.to_string_lossy().as_ref(),
+        remote_dir,
+        &local_archive,
         cancel,
-        |progress| {
+        |loaded, total| {
             report(TransferProgress {
-                phase: "transferring",
-                loaded_bytes: progress.loaded_bytes,
-                total_bytes: progress.total_bytes,
+                phase: "compressing",
+                loaded_bytes: loaded,
+                total_bytes: Some(total),
             })
         },
     )
@@ -237,8 +183,11 @@ where
     ensure_not_cancelled(cancel)?;
     local_tar_extract(&local_archive, Path::new(local_parent)).await?;
 
+    let total = std::fs::metadata(&local_archive)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+
     report_phase(&mut report, "cleaning")?;
-    let _ = remote_remove_file(session, &remote_archive).await;
     let _ = tokio::fs::remove_file(&local_archive).await;
 
     report(TransferProgress {
@@ -247,7 +196,6 @@ where
         total_bytes: Some(total),
     })?;
 
-    let _ = local_target_dir;
     Ok(total)
 }
 
@@ -269,17 +217,29 @@ where
         return Err(anyhow!("Invalid source directory path"));
     }
 
-    let source_archive = temp_remote_archive();
-    let dest_archive = join_ui_path(dest_dir, &format!("{name}.tar.gz"));
+    let local_archive = temp_local_archive();
+    let dest_archive = join_ui_path(dest_dir, &format!(".mx-txfer-{name}.tar.gz"));
 
     report_phase(&mut report, "compressing")?;
     ensure_not_cancelled(cancel)?;
-    remote_tar_create(source, source_dir, &source_archive).await?;
-
-    let total = copy_remote_to_remote_with_progress(
+    create_local_tar_gz_from_remote_dir(
         source,
+        source_dir,
+        &local_archive,
+        cancel,
+        |loaded, total| {
+            report(TransferProgress {
+                phase: "compressing",
+                loaded_bytes: loaded,
+                total_bytes: Some(total),
+            })
+        },
+    )
+    .await?;
+
+    let total = upload_local_path_with_progress(
         dest,
-        &source_archive,
+        local_archive.to_string_lossy().as_ref(),
         &dest_archive,
         cancel,
         |progress| {
@@ -294,11 +254,11 @@ where
 
     report_phase(&mut report, "extracting")?;
     ensure_not_cancelled(cancel)?;
-    remote_tar_extract(dest, &dest_archive, dest_dir).await?;
+    extract_local_tar_gz_to_remote_dir(dest, &local_archive, dest_dir, cancel).await?;
 
     report_phase(&mut report, "cleaning")?;
-    let _ = remote_remove_file(source, &source_archive).await;
     let _ = remote_remove_file(dest, &dest_archive).await;
+    let _ = tokio::fs::remove_file(&local_archive).await;
 
     report(TransferProgress {
         phase: "transferring",
@@ -318,13 +278,4 @@ pub async fn path_is_local_dir(path: &str) -> Result<bool> {
         .await
         .map_err(|e| anyhow!("Failed to read local path metadata: {e}"))?;
     Ok(meta.is_dir())
-}
-
-// Keep ui_to_sftp accessible for future archive size queries if needed.
-#[allow(dead_code)]
-fn remote_sftp_path(session: &SharedSession, path: &str) -> Result<String> {
-    let inner = session
-        .try_lock()
-        .map_err(|_| anyhow!("Session is busy"))?;
-    Ok(ui_to_sftp(path, &inner.home_path))
 }

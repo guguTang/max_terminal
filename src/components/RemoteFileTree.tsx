@@ -256,8 +256,10 @@ interface RemoteFileTreeProps {
 }
 
 export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
-  const { sessionId, connectionId, connected, selectedFile, homePath, sessions } = useSessionStore();
+  const { sessionId, connectionId, connected, selectedFile, homePath, sessions, connectBackground } =
+    useSessionStore();
   const connections = useConnectionStore((s) => s.connections);
+  const fetchConnections = useConnectionStore((s) => s.fetchConnections);
   const [currentPath, setCurrentPath] = useState<string | null>(null);
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -278,7 +280,10 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   const [infoTarget, setInfoTarget] = useState<FileEntry | null>(null);
   const [remoteCopyTarget, setRemoteCopyTarget] = useState<FileEntry | null>(null);
   const [remoteCopyDestConnectionId, setRemoteCopyDestConnectionId] = useState("");
+  const [remoteCopyDestSessionId, setRemoteCopyDestSessionId] = useState("");
+  const [remoteCopyDestHomePath, setRemoteCopyDestHomePath] = useState("/");
   const [remoteCopyDestDir, setRemoteCopyDestDir] = useState("");
+  const [remoteCopyDestConnecting, setRemoteCopyDestConnecting] = useState(false);
   const [remoteCopyCompress, setRemoteCopyCompress] = useState(false);
   const [folderTransferPrompt, setFolderTransferPrompt] = useState<FolderTransferPrompt | null>(
     null,
@@ -291,6 +296,12 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   const finishCancelled = useTransferStore((s) => s.finishCancelled);
 
   useEffect(() => {
+    if (connections.length === 0) {
+      void fetchConnections();
+    }
+  }, [connections.length, fetchConnections]);
+
+  useEffect(() => {
     if (!connectionId || !homePath) {
       setCurrentPath(null);
       return;
@@ -300,9 +311,13 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   }, [connectionId, homePath, sessionId]);
 
   useEffect(() => {
-    if (connectionId && currentPath) {
-      useWorkspaceStore.getState().setFileTreePath(connectionId, currentPath);
-    }
+    if (!connectionId || !currentPath) return;
+    const savedFor = connectionId;
+    const savedPath = currentPath;
+    useWorkspaceStore.getState().setFileTreePath(savedFor, savedPath);
+    return () => {
+      useWorkspaceStore.getState().setFileTreePath(savedFor, savedPath);
+    };
   }, [connectionId, currentPath]);
 
   useEffect(() => {
@@ -655,9 +670,14 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     setInfoTarget(entry);
   }, []);
 
-  const otherSessions = useMemo(
-    () => sessions.filter((item) => item.connectionId !== connectionId),
-    [sessions, connectionId],
+  const destConnections = useMemo(
+    () => connections.filter((item) => item.id !== connectionId),
+    [connections, connectionId],
+  );
+
+  const connectedConnectionIds = useMemo(
+    () => new Set(sessions.map((item) => item.connectionId)),
+    [sessions],
   );
 
   const connectionLabelById = useMemo(() => {
@@ -668,19 +688,56 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     return map;
   }, [connections]);
 
+  const ensureDestSession = useCallback(
+    async (destConnId: string) => {
+      const existing = sessions.find((item) => item.connectionId === destConnId);
+      if (existing) return existing;
+      return connectBackground(destConnId);
+    },
+    [connectBackground, sessions],
+  );
+
+  useEffect(() => {
+    if (!remoteCopyTarget || !remoteCopyDestConnectionId) {
+      setRemoteCopyDestSessionId("");
+      setRemoteCopyDestHomePath("/");
+      return;
+    }
+    let cancelled = false;
+    setRemoteCopyDestConnecting(true);
+    void ensureDestSession(remoteCopyDestConnectionId)
+      .then((session) => {
+        if (cancelled) return;
+        setRemoteCopyDestSessionId(session.sessionId);
+        setRemoteCopyDestHomePath(session.homePath);
+        setRemoteCopyDestDir((prev) => (prev.trim() ? prev : session.homePath));
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setRemoteCopyDestConnecting(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [remoteCopyTarget, remoteCopyDestConnectionId, ensureDestSession]);
+
   const openRemoteCopyDialog = useCallback(
     (entry: FileEntry) => {
-      const first = otherSessions[0];
+      const first = destConnections[0];
       if (!first) {
-        setError("请先连接另一台远程服务器");
+        setError("请先在连接列表中添加另一台服务器");
         return;
       }
       setRemoteCopyTarget(entry);
-      setRemoteCopyDestConnectionId(first.connectionId);
-      setRemoteCopyDestDir(first.homePath);
+      setRemoteCopyDestConnectionId(first.id);
+      setRemoteCopyDestDir("");
+      setRemoteCopyDestSessionId("");
+      setRemoteCopyDestHomePath("/");
       setRemoteCopyCompress(false);
     },
-    [otherSessions],
+    [destConnections],
   );
 
   const handleFolderTransferConfirm = useCallback(async () => {
@@ -704,11 +761,8 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
 
   const handleRemoteCopySubmit = useCallback(async () => {
     if (!sessionId || !connectionId || !remoteCopyTarget) return;
-    const destSession = otherSessions.find(
-      (item) => item.connectionId === remoteCopyDestConnectionId,
-    );
     const destDir = remoteCopyDestDir.trim();
-    if (!destSession) {
+    if (!remoteCopyDestConnectionId) {
       setError("请选择目标远程连接");
       return;
     }
@@ -722,9 +776,13 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     setNotice(null);
     const destPath = joinRemotePath(destDir, remoteCopyTarget.name);
     try {
+      let destSession = sessions.find((item) => item.connectionId === remoteCopyDestConnectionId);
+      if (!destSession) {
+        destSession = await connectBackground(remoteCopyDestConnectionId);
+      }
       const task = await invoke<TransferTaskSnapshot>("transfer_start_remote_copy", {
         sourceSessionId: sessionId,
-        destSessionId: destSession.sessionId,
+        destConnectionId: remoteCopyDestConnectionId,
         sourcePath: remoteCopyTarget.path,
         destPath,
         compress: remoteCopyTarget.isDir ? remoteCopyCompress : false,
@@ -735,8 +793,8 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
         connectionId,
         sessionId,
         remotePath: remoteCopyTarget.path,
-        destConnectionId: destSession.connectionId,
-        destSessionId: destSession.sessionId,
+        destConnectionId: remoteCopyDestConnectionId,
+        destSessionId: task.destSessionId ?? destSession.sessionId,
         destRemotePath: destPath,
         fileName: remoteCopyTarget.name,
         totalBytes: task.totalBytes ?? undefined,
@@ -760,15 +818,16 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     }
   }, [
     connectionId,
+    connectBackground,
     finishCancelled,
     finishFailed,
     finishSuccess,
-    otherSessions,
     pollTransfer,
     remoteCopyDestConnectionId,
     remoteCopyDestDir,
     remoteCopyCompress,
     remoteCopyTarget,
+    sessions,
     sessionId,
     startTransfer,
   ]);
@@ -810,70 +869,66 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   const menuItems = useMemo(() => {
     if (!menu) return [];
     const targetDir = menu.entry.isDir ? menu.entry.path : parentDir(menu.entry.path);
-    const remoteCopyItem =
-      otherSessions.length > 0
-        ? [
-            {
-              label: "复制到另一远程…",
-              action: () => openRemoteCopyDialog(menu.entry),
-            },
-          ]
-        : [];
-    return menu.entry.isDir
-      ? [
-          {
-            label: "上传文件到此目录",
-            action: () => void startUpload(targetDir, false),
-          },
-          {
-            label: "上传文件夹到此目录",
-            action: () => void startUpload(targetDir, true),
-          },
-          {
-            label: "下载目录",
-            action: () => void handleDownload(menu.entry),
-          },
-          ...remoteCopyItem,
-          {
-            label: "重命名目录",
-            action: () => openRenameDialog(menu.entry),
-          },
-          {
-            label: "删除目录",
-            action: () => openDeleteDialog(menu.entry),
-          },
-          {
-            label: "文件信息",
-            action: () => openInfoDialog(menu.entry),
-          },
-        ]
-      : [
-          {
-            label: "下载文件",
-            action: () => void handleDownload(menu.entry),
-          },
-          ...remoteCopyItem,
-          {
-            label: "上传文件到所在目录",
-            action: () => void startUpload(targetDir, false),
-          },
-          {
-            label: "上传文件夹到所在目录",
-            action: () => void startUpload(targetDir, true),
-          },
-          {
-            label: "重命名文件",
-            action: () => openRenameDialog(menu.entry),
-          },
-          {
-            label: "删除文件",
-            action: () => openDeleteDialog(menu.entry),
-          },
-          {
-            label: "文件信息",
-            action: () => openInfoDialog(menu.entry),
-          },
-        ];
+    const remoteCopyItem = {
+      label: "传输到另一 SSH…",
+      disabled: destConnections.length === 0,
+      action: () => openRemoteCopyDialog(menu.entry),
+    };
+    const dirItems = [
+      {
+        label: "上传文件到此目录",
+        action: () => void startUpload(targetDir, false),
+      },
+      {
+        label: "上传文件夹到此目录",
+        action: () => void startUpload(targetDir, true),
+      },
+      {
+        label: "下载目录",
+        action: () => void handleDownload(menu.entry),
+      },
+      remoteCopyItem,
+      {
+        label: "重命名目录",
+        action: () => openRenameDialog(menu.entry),
+      },
+      {
+        label: "删除目录",
+        action: () => openDeleteDialog(menu.entry),
+      },
+      {
+        label: "文件信息",
+        action: () => openInfoDialog(menu.entry),
+      },
+    ];
+    const fileItems = [
+      {
+        label: "下载文件",
+        action: () => void handleDownload(menu.entry),
+      },
+      remoteCopyItem,
+      {
+        label: "上传文件到所在目录",
+        action: () => void startUpload(targetDir, false),
+      },
+      {
+        label: "上传文件夹到所在目录",
+        action: () => void startUpload(targetDir, true),
+      },
+      {
+        label: "重命名文件",
+        action: () => openRenameDialog(menu.entry),
+      },
+      {
+        label: "删除文件",
+        action: () => openDeleteDialog(menu.entry),
+      },
+      {
+        label: "文件信息",
+        action: () => openInfoDialog(menu.entry),
+      },
+    ];
+    return menu.entry.isDir ? dirItems : fileItems;
   }, [
     handleDownload,
     menu,
@@ -881,7 +936,7 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     openInfoDialog,
     openRemoteCopyDialog,
     openRenameDialog,
-    otherSessions.length,
+    destConnections.length,
     startUpload,
   ]);
 
@@ -980,10 +1035,22 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
               reloadKey={reloadKey}
               mutation={mutation}
               onContextMenu={(target, event) => {
+                const itemHeight = 34;
+                const itemCount = target.isDir ? 7 : 7;
+                const menuHeight = itemHeight * itemCount + 8;
+                const menuWidth = 220;
+                let x = event.clientX;
+                let y = event.clientY;
+                if (x + menuWidth > window.innerWidth) {
+                  x = Math.max(8, x - menuWidth);
+                }
+                if (y + menuHeight > window.innerHeight) {
+                  y = Math.max(8, y - menuHeight);
+                }
                 setMenu({
                   entry: target,
-                  x: event.clientX,
-                  y: event.clientY,
+                  x,
+                  y,
                 });
               }}
             />
@@ -991,7 +1058,7 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
       </div>
       {menu && (
         <div
-          className="fixed z-[200] min-w-44 overflow-hidden rounded-md border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
+          className="fixed z-[200] min-w-44 max-h-[min(70vh,360px)] overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
           style={{ left: menu.x, top: menu.y }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -999,7 +1066,11 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
             <button
               key={item.label}
               type="button"
-              className="block w-full px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+              className={`block w-full px-3 py-1.5 text-left text-sm text-zinc-200 ${
+                "disabled" in item && item.disabled
+                  ? "cursor-not-allowed opacity-40"
+                  : "hover:bg-zinc-800"
+              }`}
               onClick={() => {
                 setMenu(null);
                 item.action();
@@ -1194,7 +1265,7 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-3 text-sm font-medium text-zinc-100">
-              复制到另一远程{remoteCopyTarget.isDir ? "目录" : "文件"}
+              传输到另一 SSH{remoteCopyTarget.isDir ? "（目录）" : "（文件）"}
             </div>
             <div className="mb-3 text-xs text-zinc-400 break-all">
               源: {remoteCopyTarget.path}
@@ -1205,36 +1276,32 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
                 <select
                   value={remoteCopyDestConnectionId}
                   onChange={(e) => {
-                    const nextId = e.target.value;
-                    setRemoteCopyDestConnectionId(nextId);
-                    const nextSession = otherSessions.find(
-                      (item) => item.connectionId === nextId,
-                    );
-                    if (nextSession) {
-                      setRemoteCopyDestDir(nextSession.homePath);
-                    }
+                    setRemoteCopyDestConnectionId(e.target.value);
+                    setRemoteCopyDestDir("");
+                    setRemoteCopyDestSessionId("");
                   }}
                   className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-blue-500"
                 >
-                  {otherSessions.map((item) => (
-                    <option key={item.connectionId} value={item.connectionId}>
-                      {connectionLabelById.get(item.connectionId) ?? item.connectionId}
+                  {destConnections.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {connectionLabelById.get(item.id) ?? item.id}
+                      {connectedConnectionIds.has(item.id) ? "" : " · 未连接"}
                     </option>
                   ))}
                 </select>
+                {remoteCopyDestConnecting && (
+                  <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
+                    <Loader2 size={12} className="animate-spin" />
+                    正在连接目标服务器…
+                  </div>
+                )}
               </div>
               <RemotePathPicker
-                sessionId={
-                  otherSessions.find((item) => item.connectionId === remoteCopyDestConnectionId)
-                    ?.sessionId ?? ""
-                }
-                homePath={
-                  otherSessions.find((item) => item.connectionId === remoteCopyDestConnectionId)
-                    ?.homePath ?? "/"
-                }
+                sessionId={remoteCopyDestSessionId}
+                homePath={remoteCopyDestHomePath}
                 value={remoteCopyDestDir}
                 onChange={setRemoteCopyDestDir}
-                disabled={busy}
+                disabled={busy || remoteCopyDestConnecting || !remoteCopyDestSessionId}
               />
               <div className="text-[11px] text-zinc-500 break-all">
                 将复制为: {joinRemotePath(remoteCopyDestDir.trim() || "/", remoteCopyTarget.name)}
@@ -1261,10 +1328,11 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
               </button>
               <button
                 type="button"
-                className="rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-500"
+                className="rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-500 disabled:opacity-40"
+                disabled={busy || remoteCopyDestConnecting || !remoteCopyDestSessionId}
                 onClick={() => void handleRemoteCopySubmit()}
               >
-                开始复制
+                开始传输
               </button>
             </div>
           </div>

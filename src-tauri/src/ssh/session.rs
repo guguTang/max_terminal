@@ -43,6 +43,16 @@ impl SessionManager {
         self.sessions.insert(session_id, session);
     }
 
+    pub async fn find_by_connection_id(&self, connection_id: &str) -> Option<(String, SharedSession)> {
+        for (session_id, session) in &self.sessions {
+            let inner = session.lock().await;
+            if inner.connection.id == connection_id {
+                return Some((session_id.clone(), session.clone()));
+            }
+        }
+        None
+    }
+
     pub async fn remove(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
             let mut inner = session.lock().await;

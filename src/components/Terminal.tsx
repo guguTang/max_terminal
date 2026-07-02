@@ -4,7 +4,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalCreateOptions } from "../types/connection";
-import { isWorkspaceSwitching } from "../layout/dockApi";
 import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import { useTerminalOutputStore } from "../stores/terminalOutputStore";
@@ -261,20 +260,7 @@ export function Terminal({
       term.dispose();
       fitRef.current = null;
       termRef.current = null;
-
-      const sessionStore = useSessionStore.getState();
-      const sessionAlive = sessionStore.sessions.some((s) => s.sessionId === boundSessionId);
-      const isBackgroundSession =
-        sessionStore.sessionId !== null && sessionStore.sessionId !== boundSessionId;
-      const isSshListView = sessionStore.sshViewMode === "list";
-
-      // 切换 SSH 或卸载后台会话面板时，保留 PTY，避免重复触发 shell 登录横幅。
-      if (!isWorkspaceSwitching() && !isBackgroundSession && !isSshListView && sessionAlive) {
-        invoke("terminal_destroy", {
-          sessionId: boundSessionId,
-          terminalId,
-        }).catch(console.error);
-      }
+      // PTY 生命周期由「关闭终端标签」与「断开连接」管理，切换 SSH 时仅卸载 xterm 视图。
     };
   }, [boundSessionId, connected, terminalId]);
 

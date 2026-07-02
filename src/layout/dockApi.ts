@@ -119,10 +119,22 @@ export async function captureTerminalRuntimeForConnection(
 }
 
 function terminalParams(terminalId: string, extra?: Record<string, unknown>) {
+  const connectionId = useSessionStore.getState().connectionId;
   return {
     terminalId,
+    ...(connectionId ? { connectionId } : {}),
     ...extra,
   };
+}
+
+function stampTerminalConnectionId(api: DockviewApi, connectionId: string) {
+  for (const panel of api.panels) {
+    if (!panel.id.startsWith("terminal")) continue;
+    panel.api.updateParameters({
+      ...(panel.params ?? {}),
+      connectionId,
+    });
+  }
 }
 
 const EDITOR_WELCOME_PANEL = {
@@ -244,6 +256,7 @@ export function restoreConnectionWorkspace(api: DockviewApi, connectionId: strin
   const snapshot = useWorkspaceStore.getState().getSnapshot(connectionId);
   if (snapshot?.dockJson) {
     api.fromJSON(snapshot.dockJson as Parameters<DockviewApi["fromJSON"]>[0]);
+    stampTerminalConnectionId(api, connectionId);
     syncTerminalTitlesForConnection(api, connectionId);
     applyTerminalRuntimeFromSnapshot(api, connectionId);
     useSessionStore.getState().setSelectedFile(snapshot.selectedFile);
@@ -252,9 +265,10 @@ export function restoreConnectionWorkspace(api: DockviewApi, connectionId: strin
   }
 
   showConnectedWorkspace(api, { preserveEditors: false, resetTerminals: true });
+  stampTerminalConnectionId(api, connectionId);
 }
 
-export function switchConnectionWorkspace(
+export async function switchConnectionWorkspace(
   api: DockviewApi,
   fromConnectionId: string | null,
   toConnectionId: string,
@@ -262,11 +276,25 @@ export function switchConnectionWorkspace(
   setWorkspaceSwitching(true);
   try {
     if (fromConnectionId && fromConnectionId !== toConnectionId) {
+      const fromSession = useSessionStore
+        .getState()
+        .sessions.find((item) => item.connectionId === fromConnectionId);
+      if (fromSession) {
+        await captureTerminalRuntimeForConnection(
+          api,
+          fromConnectionId,
+          fromSession.sessionId,
+        );
+      }
       captureConnectionWorkspace(api, fromConnectionId);
     }
     restoreConnectionWorkspace(api, toConnectionId);
   } finally {
-    window.setTimeout(() => setWorkspaceSwitching(false), 0);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.setTimeout(() => setWorkspaceSwitching(false), 400);
+      });
+    });
   }
 }
 
@@ -307,7 +335,7 @@ export function isWorkspaceSwitching() {
   return workspaceSwitching;
 }
 
-function setWorkspaceSwitching(value: boolean) {
+export function setWorkspaceSwitching(value: boolean) {
   workspaceSwitching = value;
 }
 

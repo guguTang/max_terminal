@@ -79,6 +79,32 @@ fn apply_transfer_progress(
     Ok(())
 }
 
+async fn get_or_connect_session_for_connection(
+    state: &State<'_, AppState>,
+    connection_id: &str,
+) -> Result<(String, crate::ssh::session::SharedSession), String> {
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(found) = sessions.find_by_connection_id(connection_id).await {
+            return Ok(found);
+        }
+    }
+
+    let record = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        get_connection(&conn, connection_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Connection not found".to_string())?
+    };
+
+    let (session_id, session) = connect(&record).await.map_err(|e| e.to_string())?;
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    Ok((session_id, session))
+}
+
 async fn get_session(
     state: &State<'_, AppState>,
     session_id: &str,
@@ -440,16 +466,24 @@ pub async fn transfer_start_download(
 pub async fn transfer_start_remote_copy(
     state: State<'_, AppState>,
     source_session_id: String,
-    dest_session_id: String,
+    dest_connection_id: String,
     source_path: String,
     dest_path: String,
     compress: Option<bool>,
 ) -> Result<TransferTaskSnapshot, String> {
+    let source_session = get_session(&state, &source_session_id).await?;
+    let source_connection_id = {
+        let inner = source_session.lock().await;
+        inner.connection.id.clone()
+    };
+    if source_connection_id == dest_connection_id {
+        return Err("Source and destination must be different connections".to_string());
+    }
+    let (dest_session_id, dest_session) =
+        get_or_connect_session_for_connection(&state, &dest_connection_id).await?;
     if source_session_id == dest_session_id {
         return Err("Source and destination sessions must be different".to_string());
     }
-    let source_session = get_session(&state, &source_session_id).await?;
-    let dest_session = get_session(&state, &dest_session_id).await?;
     let task_id = Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let started_at = unix_ms_now();
