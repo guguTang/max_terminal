@@ -1,0 +1,164 @@
+@import "tailwindcss";
+@import "dockview-react/dist/styles/dockview.css";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+.app-drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.drag-hotspot {
+  cursor: grab;
+  transition: background-color 120ms ease;
+}
+
+.drag-hotspot:hover {
+  background: rgba(63, 63, 70, 0.35);
+}
+
+.drag-hotspot:active {
+  cursor: grabbing;
+  background: rgba(82, 82, 91, 0.42);
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  background: #0f1117;
+  color: #e4e4e7;
+}
+
+/* dockview 深色主题微调，贴合 Max Terminal */
+.max-terminal-dockview {
+  --dv-tabs-and-actions-container-background-color: #09090b;
+  --dv-activegroup-visiblepanel-tab-background-color: #18181b;
+  --dv-activegroup-hiddenpanel-tab-background-color: #0f0f12;
+  --dv-inactivegroup-visiblepanel-tab-background-color: #0f0f12;
+  --dv-inactivegroup-hiddenpanel-tab-background-color: #0a0a0f;
+  --dv-tab-divider-color: transparent;
+  --dv-activegroup-visiblepanel-tab-color: #e4e4e7;
+  --dv-activegroup-hiddenpanel-tab-color: #71717a;
+  --dv-inactivegroup-visiblepanel-tab-color: #a1a1aa;
+  --dv-inactivegroup-hiddenpanel-tab-color: #52525b;
+  --dv-group-view-background-color: #09090b;
+  --dv-separator-border: #27272a;
+  --dv-paneview-header-border-color: #27272a;
+  --dv-icon-hover-background-color: rgba(255, 255, 255, 0.08);
+  --dv-drag-over-background-color: rgba(37, 99, 235, 0.25);
+  --dv-tabs-container-scrollbar-color: #3f3f46;
+  --dv-floating-box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.max-terminal-dockview .dv-tabs-and-actions-container {
+  border-bottom: 1px solid #27272a;
+}
+
+.max-terminal-dockview .dv-tab,
+.max-terminal-dockview .dv-default-tab {
+  touch-action: none;
+  cursor: grab;
+}
+
+.max-terminal-dockview .dv-default-tab.dv-tab-dragging {
+  cursor: grabbing;
+}
+
+.max-terminal-dockview .dv-tabs-and-actions-container .dv-void-container.dv-draggable {
+  cursor: grab;
+}
+
+.max-terminal-dockview .dv-default-tab .dv-default-tab-action {
+  display: flex;
+}
+
+.max-terminal-dockview .terminal-tab-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 26px;
+  margin: 0 0 0 2px;
+  padding: 0 8px;
+  border: 1px solid #27272a;
+  border-radius: 8px 8px 0 0;
+  border-bottom-color: transparent;
+  background: #0f0f12;
+  color: #71717a;
+  cursor: pointer;
+  transform: translateY(1px);
+}
+
+.max-terminal-dockview .terminal-tab-add-btn:hover {
+  background: #18181b;
+  color: #e4e4e7;
+  border-color: #3f3f46;
+  border-bottom-color: transparent;
+}
+
+/* 拖拽到布局外边缘时的放置提示（底部全宽停靠） */
+.max-terminal-dockview .dv-drop-target-edge {
+  z-index: 50;
+}
+
+.max-terminal-dockview .dv-drop-target-edge .dv-drop-target-dropzone {
+  background: rgba(37, 99, 235, 0.22);
+  outline: 2px solid rgba(59, 130, 246, 0.75);
+  outline-offset: -2px;
+}
+
+.max-terminal-dockview .dv-drop-target-edge .dv-drop-target-bottom {
+  border-bottom: 4px solid #3b82f6;
+  box-shadow: inset 0 -8px 24px rgba(59, 130, 246, 0.15);
+}
+
+/* xterm 填满面板，避免 PTY 列宽与显示区域不一致 */
+.terminal-host .xterm {
+  height: 100%;
+  width: 100%;
+  padding: 0;
+}
+
+.terminal-host .xterm-viewport {
+  overflow-y: auto;
+}
+
+/* 远程文件树滚动条：深色风格，横向按需显示 */
+.remote-file-tree-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #52525b #18181b;
+}
+
+.remote-file-tree-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.remote-file-tree-scroll::-webkit-scrollbar-track {
+  background: #18181b !important;
+}
+
+.remote-file-tree-scroll::-webkit-scrollbar-thumb {
+  background: #52525b !important;
+  border-radius: 999px;
+  border: 2px solid #18181b !important;
+}
+
+.remote-file-tree-scroll::-webkit-scrollbar-thumb:hover {
+  background: #71717a !important;
+}
