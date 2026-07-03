@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+          # macOS Intel
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+          # Linux x64
+          - platform: ubuntu-22.04
+            args: ''
+          # Linux ARM64（仅 GitHub 公开仓库可用 ubuntu-22.04-arm runner）
+          - platform: ubuntu-22.04-arm
+            args: ''
+          # Windows x64
+          - platform: windows-latest
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-22.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # push tag 时用已有 tag；手动触发时从 tauri.conf.json 读取版本
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseName: Max Terminal ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseBody: |
+            在下方 Assets 中下载对应平台的安装包。
+
+            | 平台 | 架构 |
+            |------|------|
+            | macOS | Apple Silicon (aarch64)、Intel (x86_64) |
+            | Windows | x64 |
+            | Linux | x64、ARM64 |
+          releaseDraft: true
+          prerelease: ${{ github.ref_type == 'tag' && contains(github.ref_name, '-') }}
+          releaseAssetNamePattern: '[name]-[version]-[platform]-[arch][ext]'
+          args: ${{ matrix.args }}
