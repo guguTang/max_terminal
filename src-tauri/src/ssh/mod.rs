@@ -1,5 +1,6 @@
 pub mod archive_sftp;
 pub mod archive_transfer;
+pub mod context;
 pub mod exec;
 pub mod handler;
 pub mod pty;

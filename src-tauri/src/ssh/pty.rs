@@ -1,5 +1,8 @@
 use crate::ssh::handler::SshHandler;
-use crate::ssh::terminal_meta::{build_bootstrap_script, is_valid_cwd_path};
+use crate::ssh::terminal_meta::{
+    build_bootstrap_script, build_cwd_hook_install_command, filter_terminal_setup_echo,
+    is_valid_cwd_path,
+};
 use anyhow::{anyhow, Result};
 use russh::{client, ChannelMsg};
 use serde::Serialize;
@@ -19,6 +22,7 @@ struct CwdQueryState {
 struct CwdCapture {
     buffer: String,
     pending: Option<CwdQueryState>,
+    hook_installing: bool,
 }
 
 impl CwdCapture {
@@ -26,7 +30,22 @@ impl CwdCapture {
         Self {
             buffer: String::new(),
             pending: None,
+            hook_installing: false,
         }
+    }
+
+    fn begin_hook_install(&mut self) {
+        self.hook_installing = true;
+        self.buffer.clear();
+    }
+
+    fn end_hook_install(&mut self) {
+        self.hook_installing = false;
+        self.buffer.clear();
+    }
+
+    fn is_hook_installing(&self) -> bool {
+        self.hook_installing
     }
 
     fn begin_query(&mut self, token: &str, tx: oneshot::Sender<String>) {
@@ -42,12 +61,21 @@ impl CwdCapture {
     }
 
     fn process_chunk(&mut self, chunk: &str) -> String {
+        if self.hook_installing {
+            self.buffer.push_str(chunk);
+            if self.buffer.contains("__MX_HOOK_OK__") || self.buffer.contains("\x1b]7;file://") || self.buffer.contains("\x1b]7799;") {
+                self.hook_installing = false;
+                self.buffer.clear();
+            }
+            return String::new();
+        }
+
         self.buffer.push_str(chunk);
         let mut display = String::new();
 
         loop {
             let Some(pending) = self.pending.as_ref() else {
-                display.push_str(&self.buffer);
+                display.push_str(&filter_terminal_setup_echo(&self.buffer));
                 self.buffer.clear();
                 break;
             };
@@ -58,18 +86,20 @@ impl CwdCapture {
             let Some(start) = self.buffer.find(&start_marker) else {
                 let keep = partial_prefix_overlap(&self.buffer, &start_marker);
                 if keep == 0 {
-                    display.push_str(&self.buffer);
+                    let flushed = filter_terminal_setup_echo(&self.buffer);
+                    display.push_str(&flushed);
                     self.buffer.clear();
                 } else if self.buffer.len() > keep {
                     let flush_end = self.buffer.len() - keep;
-                    display.push_str(&self.buffer[..flush_end]);
+                    let flushed = filter_terminal_setup_echo(&self.buffer[..flush_end]);
+                    display.push_str(&flushed);
                     self.buffer = self.buffer[flush_end..].to_string();
                 }
                 break;
             };
 
             if start > 0 {
-                display.push_str(&self.buffer[..start]);
+                display.push_str(&filter_terminal_setup_echo(&self.buffer[..start]));
             }
 
             let after_start = &self.buffer[start + start_marker.len()..];
@@ -138,13 +168,13 @@ pub async fn query_cwd(terminal: &TerminalHandle) -> Result<String> {
         guard.begin_query(&token, tx);
     }
 
-    // 静默查询当前 cwd：临时关闭 tty echo，避免把探测命令显示到用户终端。
+    // 整段探测在单行内完成，减少 stty 命令被分步回显。
     let cmd = format!(
-        "stty -echo; __mx_pwd=\"$(pwd)\"; stty echo; printf '{start_marker}%s{end_marker}\\n' \"$__mx_pwd\"\n"
+        "stty -echo 2>/dev/null; __mx_pwd=\"$(pwd)\"; stty echo 2>/dev/null; printf '{start_marker}%s{end_marker}\\n' \"$__mx_pwd\"\n"
     );
     write_input(terminal, &cmd).await?;
 
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    let result = match tokio::time::timeout(Duration::from_secs(5), rx).await {
         Ok(Ok(path)) if is_valid_cwd_path(&path) => Ok(path),
         Ok(Ok(_)) => {
             terminal.cwd_capture.lock().await.clear_pending();
@@ -158,7 +188,9 @@ pub async fn query_cwd(terminal: &TerminalHandle) -> Result<String> {
             terminal.cwd_capture.lock().await.clear_pending();
             Err(anyhow!("CWD query timed out"))
         }
-    }
+    };
+
+    result
 }
 
 pub async fn apply_terminal_state(
@@ -180,6 +212,37 @@ pub async fn apply_terminal_state(
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     write_input(terminal, &script).await
+}
+
+pub async fn install_cwd_hook(terminal: &TerminalHandle) -> Result<()> {
+    match tokio::time::timeout(Duration::from_secs(8), terminal.shell_ready.notified()).await {
+        Ok(()) => {}
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    {
+        let mut guard = terminal.cwd_capture.lock().await;
+        guard.begin_hook_install();
+    }
+    write_input(terminal, &build_cwd_hook_install_command()).await?;
+    for _ in 0..150 {
+        let done = {
+            let guard = terminal.cwd_capture.lock().await;
+            !guard.is_hook_installing()
+        };
+        if done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    {
+        let mut guard = terminal.cwd_capture.lock().await;
+        guard.end_hook_install();
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -329,6 +392,21 @@ mod tests {
         let out = capture.process_chunk(prompt);
         assert_eq!(out, prompt);
         assert!(capture.buffer.is_empty());
+    }
+
+    #[test]
+    fn cwd_capture_suppresses_probe_echo() {
+        let mut capture = CwdCapture::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        capture.begin_query("abc123", tx);
+
+        let echo = "(base) [root@k8s-master-34 ~]# stty -echo 2>/dev/null\n";
+        let out = capture.process_chunk(echo);
+        assert_eq!(out, "");
+
+        let response = "__MXCWD_abc123__/root__MXEND_abc123__\n";
+        let out = capture.process_chunk(response);
+        assert_eq!(out, "\n");
     }
 
     #[test]

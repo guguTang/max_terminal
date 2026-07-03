@@ -164,26 +164,53 @@ export function installAppClosePersistence(
     mode: AppMode;
     transferOpen: boolean;
     saveCurrentDockLayout: () => void;
+    saveCurrentDockLayoutAsync?: () => Promise<void>;
   },
-  onClose?: () => void,
+  onClose?: () => void | Promise<void>,
 ) {
   if (closeHookInstalled) return;
   closeHookInstalled = true;
 
-  const flushOnClose = () => {
-    getInput().saveCurrentDockLayout();
-    void persistAppState({
-      mode: getInput().mode,
-      transferOpen: getInput().transferOpen,
-    });
-    onClose?.();
+  const flushOnClose = async () => {
+    const input = getInput();
+    try {
+      if (input.saveCurrentDockLayoutAsync) {
+        await input.saveCurrentDockLayoutAsync();
+      } else {
+        input.saveCurrentDockLayout();
+      }
+      await persistAppState({
+        mode: input.mode,
+        transferOpen: input.transferOpen,
+      });
+      await onClose?.();
+    } catch (error) {
+      console.error("flushOnClose failed:", error);
+    }
   };
 
-  window.addEventListener("beforeunload", flushOnClose);
+  const closeApp = async () => {
+    await flushOnClose();
+    try {
+      await getCurrentWindow().destroy();
+    } catch (error) {
+      console.error("window destroy failed:", error);
+    }
+    try {
+      await invoke("exit_app");
+    } catch (error) {
+      console.error("exit_app failed:", error);
+    }
+  };
+
+  window.addEventListener("beforeunload", () => {
+    void flushOnClose();
+  });
 
   void getCurrentWindow()
-    .onCloseRequested(() => {
-      flushOnClose();
+    .onCloseRequested(async (event) => {
+      event.preventDefault();
+      await closeApp();
     })
     .catch(() => {
       // non-tauri environment

@@ -12,6 +12,7 @@ import {
   setDockApi,
 } from "../layout/dockApi";
 import { getTerminalIdFromPanel, isTerminalPanel } from "../layout/terminalDock";
+import { clearTerminalContextCache } from "../lib/terminalContextCache";
 import { LOCAL_SESSION_ID, LOCAL_WORKSPACE_ID } from "../stores/localConsoleStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import { useTerminalOutputStore } from "../stores/terminalOutputStore";
@@ -49,6 +50,7 @@ export function ConsoleDockLayout({ layoutKey }: ConsoleDockLayoutProps) {
       const terminalId = getTerminalIdFromPanel(panel);
       useTerminalMetaStore.getState().clearTerminal(LOCAL_SESSION_ID, terminalId);
       useTerminalOutputStore.getState().clearTerminal(LOCAL_SESSION_ID, terminalId);
+      clearTerminalContextCache(LOCAL_SESSION_ID, terminalId);
       useTerminalTitleStore.getState().removeTerminal(LOCAL_WORKSPACE_ID, terminalId);
       void invoke("terminal_destroy", {
         sessionId: LOCAL_SESSION_ID,

@@ -5,13 +5,18 @@ import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import { useTerminalTitleStore } from "../stores/terminalTitleStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
-import type { TerminalMeta } from "../types/connection";
-import type { FileEntry } from "../types/connection";
+import type { TerminalMeta, FileEntry } from "../types/connection";
 
 function isValidCwdPath(path?: string) {
   if (!path) return false;
   const trimmed = path.trim();
-  if (!trimmed || trimmed.includes("$") || trimmed.includes('"') || trimmed.includes("`")) {
+  if (
+    !trimmed ||
+    trimmed.includes("$") ||
+    trimmed.includes('"') ||
+    trimmed.includes("`") ||
+    /\s/.test(trimmed)
+  ) {
     return false;
   }
   return trimmed.startsWith("/") || trimmed.startsWith("~");
@@ -76,66 +81,389 @@ function terminalIdsInLayout(api: DockviewApi) {
     );
 }
 
-function applyTerminalRuntimeFromSnapshot(api: DockviewApi, connectionId: string) {
+/** 从快照 dockJson + terminalRuntimeById 汇总应存在的终端 id */
+function collectTerminalIdsFromSnapshot(connectionId: string): string[] {
   const snapshot = useWorkspaceStore.getState().getSnapshot(connectionId);
-  if (!snapshot) return;
-  const runtimeById = snapshot.terminalRuntimeById ?? {};
+  if (!snapshot) return [DEFAULT_TERMINAL_ID];
+
+  const ids = new Set<string>(Object.keys(snapshot.terminalRuntimeById ?? {}));
+  const dockJson = snapshot.dockJson as {
+    panels?: Record<string, { id?: string; params?: { terminalId?: string } }>;
+  } | null;
+  if (dockJson?.panels) {
+    for (const panel of Object.values(dockJson.panels)) {
+      const panelId = panel?.id ?? "";
+      if (!panelId.startsWith("terminal")) continue;
+      ids.add(panel.params?.terminalId ?? DEFAULT_TERMINAL_ID);
+    }
+  }
+  return ids.size > 0 ? [...ids] : [DEFAULT_TERMINAL_ID];
+}
+
+function hydrateTerminalMetaFromSnapshot(connectionId: string, sessionId: string) {
+  const runtime =
+    useWorkspaceStore.getState().getSnapshot(connectionId)?.terminalRuntimeById ?? {};
+  const metaStore = useTerminalMetaStore.getState();
+  for (const [terminalId, meta] of Object.entries(runtime)) {
+    if (!meta.cwd && Object.keys(meta.env ?? {}).length === 0) continue;
+    metaStore.patchMeta(sessionId, terminalId, meta);
+  }
+}
+
+/** 按快照补齐缺失的终端标签（恢复失败或仅保存了 runtime 时） */
+function ensureTerminalPanelsFromSnapshot(api: DockviewApi, connectionId: string) {
+  const terminalIds = collectTerminalIdsFromSnapshot(connectionId);
+  const layoutIds = new Set(terminalIdsInLayout(api));
+  const homePath = homePathForConnection(connectionId);
+
+  for (const terminalId of terminalIds) {
+    if (layoutIds.has(terminalId)) continue;
+    const existingTerminal = api.panels.find((p) => p.id.startsWith("terminal"));
+    const runtimeParams = terminalRuntimeParamsForConnection(
+      connectionId,
+      terminalId,
+      homePath,
+    );
+    api.addPanel({
+      id: terminalPanelId(terminalId),
+      component: "terminal",
+      title: resolveTerminalTitle(terminalId),
+      params: terminalParams(terminalId, runtimeParams),
+      position: existingTerminal
+        ? { referencePanel: existingTerminal.id, direction: "within" }
+        : api.getPanel(FILES_PANEL.id)
+          ? { referencePanel: FILES_PANEL.id, direction: "below" }
+          : undefined,
+    });
+    layoutIds.add(terminalId);
+  }
+  syncTerminalTitlesForConnection(api, connectionId);
+}
+
+function homePathForConnection(connectionId: string) {
+  return (
+    useSessionStore.getState().sessions.find((item) => item.connectionId === connectionId)
+      ?.homePath ?? null
+  );
+}
+
+/** 从快照取终端 cwd/env；与 home 相同时不传 initialCwd，避免多余 cd */
+function terminalRuntimeParamsForConnection(
+  connectionId: string,
+  terminalId: string,
+  homePath?: string | null,
+) {
+  const runtime =
+    useWorkspaceStore.getState().getSnapshot(connectionId)?.terminalRuntimeById?.[terminalId];
+  if (!runtime) return {};
+  const params: { initialCwd?: string; initialEnv?: Record<string, string> } = {};
+  if (
+    runtime.cwd &&
+    isValidCwdPath(runtime.cwd) &&
+    (!homePath || runtime.cwd !== homePath)
+  ) {
+    params.initialCwd = runtime.cwd;
+  }
+  if (runtime.env && Object.keys(runtime.env).length > 0) {
+    params.initialEnv = runtime.env;
+  }
+  return params;
+}
+
+function injectTerminalRuntimeIntoDockJson(dockJson: unknown, connectionId: string) {
+  if (!dockJson || typeof dockJson !== "object") return dockJson;
+
+  const json = dockJson as {
+    panels?: Record<string, { id?: string; params?: Record<string, unknown> }>;
+  };
+  if (!json.panels) return dockJson;
+
+  const homePath = homePathForConnection(connectionId);
+  const panels = { ...json.panels };
+  for (const [key, panel] of Object.entries(panels)) {
+    const panelId = panel?.id ?? key;
+    if (!panelId.startsWith("terminal")) continue;
+    const terminalId =
+      (panel.params?.terminalId as string | undefined) ?? DEFAULT_TERMINAL_ID;
+    const runtimeParams = terminalRuntimeParamsForConnection(
+      connectionId,
+      terminalId,
+      homePath,
+    );
+    if (!runtimeParams.initialCwd && !runtimeParams.initialEnv) continue;
+    panels[key] = {
+      ...panel,
+      params: {
+        ...(panel.params ?? {}),
+        connectionId,
+        ...runtimeParams,
+      },
+    };
+  }
+  return { ...json, panels };
+}
+
+/** 用前端跟踪的 cwd 刷新快照（query 失败时的兜底） */
+export function refreshTerminalRuntimeFromMetaStore(
+  connectionId: string,
+  sessionId: string,
+  terminalIds: string[],
+) {
+  const existing =
+    useWorkspaceStore.getState().getSnapshot(connectionId)?.terminalRuntimeById ?? {};
+  const runtimeById: Record<string, TerminalMeta> = { ...existing };
+  const metaStore = useTerminalMetaStore.getState();
+
+  const ids = terminalIds.length > 0 ? terminalIds : [DEFAULT_TERMINAL_ID];
+  for (const terminalId of ids) {
+    const live = metaStore.getMeta(sessionId, terminalId);
+    if (!live?.cwd) continue;
+    runtimeById[terminalId] = {
+      cwd: live.cwd,
+      env: live.env ?? runtimeById[terminalId]?.env ?? {},
+    };
+  }
+
+  if (Object.keys(runtimeById).length > 0) {
+    useWorkspaceStore.getState().setTerminalRuntimeById(connectionId, runtimeById);
+  }
+}
+
+export function refreshActiveTerminalRuntimeFromMetaStore(api: DockviewApi) {
+  const { connectionId, sessionId } = useSessionStore.getState();
+  if (!connectionId || !sessionId) return;
+  refreshTerminalRuntimeFromMetaStore(connectionId, sessionId, terminalIdsInLayout(api));
+}
+
+/** 退出前同步保存各连接的工作目录与布局快照 */
+export async function captureWorkspaceBeforeClose() {
+  const api = getDockApi();
+  const { sessions, connectionId, sessionId } = useSessionStore.getState();
+
+  if (api) {
+    for (const session of sessions) {
+      const terminalIds =
+        session.connectionId === connectionId
+          ? terminalIdsInLayout(api)
+          : collectTerminalIdsFromSnapshot(session.connectionId);
+      const existing =
+        useWorkspaceStore.getState().getSnapshot(session.connectionId)?.terminalRuntimeById ?? {};
+      const runtimeById = await captureRuntimeForTerminals(
+        session.sessionId,
+        terminalIds,
+        existing,
+      );
+      if (Object.keys(runtimeById).length > 0) {
+        useWorkspaceStore.getState().setTerminalRuntimeById(session.connectionId, runtimeById);
+      }
+    }
+
+    if (connectionId && sessionId) {
+      captureConnectionWorkspace(api, connectionId);
+    }
+    return;
+  }
+
+  for (const session of sessions) {
+    const terminalIds = collectTerminalIdsFromSnapshot(session.connectionId);
+    const existing =
+      useWorkspaceStore.getState().getSnapshot(session.connectionId)?.terminalRuntimeById ?? {};
+    const runtimeById = await captureRuntimeForTerminals(
+      session.sessionId,
+      terminalIds,
+      existing,
+    );
+    if (Object.keys(runtimeById).length > 0) {
+      useWorkspaceStore.getState().setTerminalRuntimeById(session.connectionId, runtimeById);
+    }
+  }
+}
+
+function applyTerminalRuntimeFromSnapshot(api: DockviewApi, connectionId: string) {
+  const homePath = homePathForConnection(connectionId);
   for (const panel of api.panels) {
     if (!panel.id.startsWith("terminal")) continue;
     const terminalId =
       ((panel.params as { terminalId?: string } | undefined)?.terminalId ?? DEFAULT_TERMINAL_ID);
-    const runtime = runtimeById[terminalId];
-    if (!runtime) continue;
+    const runtimeParams = terminalRuntimeParamsForConnection(
+      connectionId,
+      terminalId,
+      homePath,
+    );
+    if (!runtimeParams.initialCwd && !runtimeParams.initialEnv) continue;
     panel.api.updateParameters({
       ...(panel.params ?? {}),
-      initialCwd: runtime.cwd,
-      initialEnv: runtime.env,
+      ...runtimeParams,
     });
   }
+}
+
+/** 切换连接前捕获当前工作区（须在更新 sessionStore.connectionId 之前调用） */
+export async function captureConnectionWorkspaceSnapshot(
+  connectionId: string,
+  sessionId: string,
+) {
+  const api = getDockApi();
+  if (!api) return;
+  setWorkspaceSwitching(true);
+  await captureTerminalRuntimeForConnection(api, connectionId, sessionId);
+  captureConnectionWorkspace(api, connectionId);
+}
+
+async function captureRuntimeForTerminals(
+  sessionId: string,
+  terminalIds: string[],
+  existing: Record<string, TerminalMeta>,
+  options?: { queryCwd?: boolean },
+) {
+  const runtimeById: Record<string, TerminalMeta> = { ...existing };
+  const metaStore = useTerminalMetaStore.getState();
+  const ids = terminalIds.length > 0 ? terminalIds : [DEFAULT_TERMINAL_ID];
+  const queryCwd = options?.queryCwd ?? false;
+
+  for (const terminalId of ids) {
+    let cwd: string | undefined;
+    let env = runtimeById[terminalId]?.env ?? {};
+
+    if (queryCwd) {
+      try {
+        const queried = await invoke<string>("terminal_query_cwd", {
+          sessionId,
+          terminalId,
+        });
+        if (isValidCwdPath(queried)) {
+          cwd = queried;
+        }
+      } catch {
+        // PTY 可能尚未创建
+      }
+    }
+
+    if (!cwd) {
+      const live = metaStore.getMeta(sessionId, terminalId);
+      if (live?.cwd && isValidCwdPath(live.cwd)) {
+        cwd = live.cwd;
+        env = { ...env, ...live.env };
+      }
+    }
+
+    if (!cwd) {
+      try {
+        const meta = await invoke<TerminalMeta>("terminal_get_meta", {
+          sessionId,
+          terminalId,
+        });
+        if (isValidCwdPath(meta.cwd)) {
+          cwd = meta.cwd;
+          env = meta.env;
+        }
+      } catch {
+        const cached = runtimeById[terminalId];
+        if (cached?.cwd && isValidCwdPath(cached.cwd)) {
+          cwd = cached.cwd;
+        }
+      }
+    }
+
+    if (!cwd) continue;
+
+    runtimeById[terminalId] = { cwd, env };
+  }
+
+  return runtimeById;
 }
 
 export async function captureTerminalRuntimeForConnection(
   api: DockviewApi,
   connectionId: string,
   sessionId: string,
+  options?: { queryCwd?: boolean },
 ) {
-  const runtimeById: Record<string, TerminalMeta> = {};
   const terminalIds = terminalIdsInLayout(api);
-  for (const terminalId of terminalIds) {
-    try {
-      const meta = await invoke<TerminalMeta>("terminal_get_meta", {
-        sessionId,
-        terminalId,
-      });
-      runtimeById[terminalId] = meta;
-      useTerminalMetaStore.getState().patchMeta(sessionId, terminalId, meta);
-    } catch {
-      const cached = useTerminalMetaStore.getState().getMeta(sessionId, terminalId);
-      if (cached) {
-        runtimeById[terminalId] = cached;
-      }
-    }
+  const existing =
+    useWorkspaceStore.getState().getSnapshot(connectionId)?.terminalRuntimeById ?? {};
+  const runtimeById = await captureRuntimeForTerminals(
+    sessionId,
+    terminalIds,
+    existing,
+    options,
+  );
+  const metaStore = useTerminalMetaStore.getState();
+
+  for (const [terminalId, meta] of Object.entries(runtimeById)) {
+    metaStore.patchMeta(sessionId, terminalId, meta);
   }
+
   useWorkspaceStore.getState().setTerminalRuntimeById(connectionId, runtimeById);
 }
 
-function terminalParams(terminalId: string, extra?: Record<string, unknown>) {
+function panelParams(extra?: Record<string, unknown>) {
   const connectionId = useSessionStore.getState().connectionId;
   return {
-    terminalId,
     ...(connectionId ? { connectionId } : {}),
     ...extra,
   };
 }
 
-function stampTerminalConnectionId(api: DockviewApi, connectionId: string) {
+function terminalParams(terminalId: string, extra?: Record<string, unknown>) {
+  return {
+    terminalId,
+    ...panelParams(extra),
+  };
+}
+
+function stampConnectionIdOnPanels(api: DockviewApi, connectionId: string) {
   for (const panel of api.panels) {
-    if (!panel.id.startsWith("terminal")) continue;
     panel.api.updateParameters({
       ...(panel.params ?? {}),
       connectionId,
     });
   }
+}
+
+const KNOWN_PANEL_COMPONENTS = new Set(["files", "editorWelcome", "editor", "terminal"]);
+
+/** 移除 dockview 中无面板的空 group（切换时 fromJSON 常会残留，表现为顶部空白区域） */
+function pruneEmptyDockGroups(api: DockviewApi) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const group of [...api.groups]) {
+      if (group.panels.length === 0) {
+        api.removeGroup(group);
+        changed = true;
+      }
+    }
+  }
+}
+
+function isHealthyConnectedLayout(api: DockviewApi) {
+  pruneEmptyDockGroups(api);
+  const panels = api.panels;
+  const ids = panels.map((panel) => panel.id);
+  if (ids.length !== new Set(ids).size) return false;
+  if (ids.filter((id) => id === FILES_PANEL.id).length !== 1) return false;
+  if (!ids.some((id) => id.startsWith("terminal"))) return false;
+  if (ids.filter((id) => id === EDITOR_WELCOME_PANEL.id).length > 1) return false;
+  if (panels.some((panel) => !KNOWN_PANEL_COMPONENTS.has(panel.api.component as string))) {
+    return false;
+  }
+  if (api.groups.some((group) => group.panels.length === 0)) return false;
+  if (api.groups.length > panels.length) return false;
+  const unknown = ids.filter(
+    (id) =>
+      id !== FILES_PANEL.id &&
+      id !== EDITOR_WELCOME_PANEL.id &&
+      !id.startsWith("editor:") &&
+      !id.startsWith("terminal"),
+  );
+  return unknown.length === 0 && ids.length <= 24;
+}
+
+export function notifyDockLayoutResize() {
+  window.setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+  window.setTimeout(() => window.dispatchEvent(new Event("resize")), 200);
+  window.setTimeout(() => window.dispatchEvent(new Event("resize")), 450);
 }
 
 const EDITOR_WELCOME_PANEL = {
@@ -184,6 +512,7 @@ function dockTerminalFullWidth(api: DockviewApi, terminalHeight?: number) {
   if (terminalHeight) {
     terminalPanel.group.api.setSize({ height: terminalHeight });
   }
+  pruneEmptyDockGroups(api);
 }
 
 /** 连接后按正确顺序搭建工作区，使终端横跨文件树+编辑器 */
@@ -216,6 +545,7 @@ export function showConnectedWorkspace(
 
   const files = api.addPanel({
     ...FILES_PANEL,
+    params: panelParams(),
     initialWidth: filesWidth,
     ...(terminalPanel
       ? { position: { referencePanel: terminalPanel.id, direction: "right" as const } }
@@ -225,6 +555,7 @@ export function showConnectedWorkspace(
   if (editorPaths.length === 0) {
     api.addPanel({
       ...EDITOR_WELCOME_PANEL,
+      params: panelParams(),
       position: { referencePanel: FILES_PANEL.id, direction: "right" },
     });
   } else {
@@ -237,7 +568,14 @@ export function showConnectedWorkspace(
     api.addPanel({
       ...TERMINAL_PANEL,
       title: resolveTerminalTitle(DEFAULT_TERMINAL_ID),
-      params: terminalParams(DEFAULT_TERMINAL_ID),
+      params: terminalParams(
+        DEFAULT_TERMINAL_ID,
+        terminalRuntimeParamsForConnection(
+          currentConnectionId,
+          DEFAULT_TERMINAL_ID,
+          useSessionStore.getState().homePath,
+        ),
+      ),
       initialHeight: terminalHeight,
       position: { referencePanel: FILES_PANEL.id, direction: "below" },
     });
@@ -246,30 +584,71 @@ export function showConnectedWorkspace(
   syncTerminalTitlesForConnection(api, currentConnectionId);
 
   dockTerminalFullWidth(api, terminalHeight);
+  pruneEmptyDockGroups(api);
   files.api.setActive();
 }
 
 export function captureConnectionWorkspace(api: DockviewApi, connectionId: string) {
+  pruneEmptyDockGroups(api);
   useWorkspaceStore.getState().capture(api, connectionId);
+}
+
+export function captureConnectionWorkspaceForced(api: DockviewApi, connectionId: string) {
+  pruneEmptyDockGroups(api);
+  useWorkspaceStore.getState().captureForced(api, connectionId);
 }
 
 export function restoreConnectionWorkspace(api: DockviewApi, connectionId: string) {
   const snapshot = useWorkspaceStore.getState().getSnapshot(connectionId);
-  if (snapshot?.dockJson) {
-    api.fromJSON(snapshot.dockJson as Parameters<DockviewApi["fromJSON"]>[0]);
-    stampTerminalConnectionId(api, connectionId);
-    syncTerminalTitlesForConnection(api, connectionId);
-    applyTerminalRuntimeFromSnapshot(api, connectionId);
-    useSessionStore.getState().setSelectedFile(snapshot.selectedFile);
-    dockTerminalFullWidthAfterConnect(api);
-    return;
+  const sessionId = useSessionStore
+    .getState()
+    .sessions.find((item) => item.connectionId === connectionId)?.sessionId;
+  if (sessionId) {
+    hydrateTerminalMetaFromSnapshot(connectionId, sessionId);
   }
 
+  const finishRestore = () => {
+    ensureTerminalPanelsFromSnapshot(api, connectionId);
+    applyTerminalRuntimeFromSnapshot(api, connectionId);
+    useSessionStore.getState().setSelectedFile(snapshot?.selectedFile ?? null);
+    dockTerminalFullWidthAfterConnect(api);
+    pruneEmptyDockGroups(api);
+    notifyDockLayoutResize();
+    captureConnectionWorkspaceForced(api, connectionId);
+  };
+
+  if (snapshot?.dockJson) {
+    try {
+      const dockJson = injectTerminalRuntimeIntoDockJson(snapshot.dockJson, connectionId);
+      api.clear();
+      api.fromJSON(dockJson as Parameters<DockviewApi["fromJSON"]>[0]);
+      stampConnectionIdOnPanels(api, connectionId);
+      pruneEmptyDockGroups(api);
+      if (!isHealthyConnectedLayout(api)) {
+        throw new Error("unhealthy workspace layout after restore");
+      }
+      syncTerminalTitlesForConnection(api, connectionId);
+      finishRestore();
+      if (!isHealthyConnectedLayout(api)) {
+        throw new Error("unhealthy workspace layout after dock terminal");
+      }
+      return;
+    } catch {
+      // 保留 dockJson 快照，回退到默认连接布局并补齐终端标签
+    }
+  }
+
+  api.clear();
   showConnectedWorkspace(api, { preserveEditors: false, resetTerminals: true });
-  stampTerminalConnectionId(api, connectionId);
+  stampConnectionIdOnPanels(api, connectionId);
+  pruneEmptyDockGroups(api);
+  syncTerminalTitlesForConnection(api, connectionId);
+  finishRestore();
 }
 
-export async function switchConnectionWorkspace(
+let workspaceSwitchChain: Promise<void> = Promise.resolve();
+
+async function performSwitchConnectionWorkspace(
   api: DockviewApi,
   fromConnectionId: string | null,
   toConnectionId: string,
@@ -277,26 +656,29 @@ export async function switchConnectionWorkspace(
   setWorkspaceSwitching(true);
   try {
     if (fromConnectionId && fromConnectionId !== toConnectionId) {
-      const fromSession = useSessionStore
-        .getState()
-        .sessions.find((item) => item.connectionId === fromConnectionId);
-      if (fromSession) {
-        await captureTerminalRuntimeForConnection(
-          api,
-          fromConnectionId,
-          fromSession.sessionId,
-        );
-      }
-      captureConnectionWorkspace(api, fromConnectionId);
+      // activateSession 已捕获 cwd/meta；此处仅强制保存来源连接布局（勿 query_cwd，会向 PTY 注入换行）
+      captureConnectionWorkspaceForced(api, fromConnectionId);
     }
     restoreConnectionWorkspace(api, toConnectionId);
+    notifyDockLayoutResize();
   } finally {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        window.setTimeout(() => setWorkspaceSwitching(false), 400);
+        window.setTimeout(() => setWorkspaceSwitching(false), 800);
       });
     });
   }
+}
+
+export function switchConnectionWorkspace(
+  api: DockviewApi,
+  fromConnectionId: string | null,
+  toConnectionId: string,
+) {
+  workspaceSwitchChain = workspaceSwitchChain
+    .catch(() => {})
+    .then(() => performSwitchConnectionWorkspace(api, fromConnectionId, toConnectionId));
+  return workspaceSwitchChain;
 }
 
 /** 断开后隐藏远程文件与编辑器，终端回到底部全宽 */
@@ -712,6 +1094,28 @@ function syncConsoleTerminalTitles(api: DockviewApi) {
   }
 }
 
+function stampConsoleKindOnPanels(api: DockviewApi) {
+  for (const panel of [...api.panels]) {
+    if (!panel.id.startsWith("terminal")) {
+      panel.api.close();
+      continue;
+    }
+    const { connectionId: _drop, ...rest } = (panel.params ?? {}) as {
+      connectionId?: string;
+      [key: string]: unknown;
+    };
+    panel.api.updateParameters({
+      ...rest,
+      workspaceKind: "local",
+    });
+  }
+}
+
+function isHealthyConsoleLayout(api: DockviewApi) {
+  pruneEmptyDockGroups(api);
+  return api.panels.some((panel) => panel.id.startsWith("terminal"));
+}
+
 export function createConsoleDefaultLayout(api: DockviewApi) {
   api.clear();
   const { terminalHeight } = getInitialPanelSizes(api);
@@ -724,14 +1128,24 @@ export function createConsoleDefaultLayout(api: DockviewApi) {
   });
 
   dockTerminalFullWidth(api, terminalHeight);
+  pruneEmptyDockGroups(api);
 }
 
 export function loadConsoleSavedLayout(api: DockviewApi): boolean {
   const raw = localStorage.getItem(CONSOLE_LAYOUT_STORAGE_KEY);
   if (!raw) return false;
   try {
+    api.clear();
     api.fromJSON(JSON.parse(raw));
+    stampConsoleKindOnPanels(api);
+    pruneEmptyDockGroups(api);
+    if (!isHealthyConsoleLayout(api)) {
+      throw new Error("unhealthy console layout");
+    }
     syncConsoleTerminalTitles(api);
+    const { terminalHeight } = getInitialPanelSizes(api);
+    dockTerminalFullWidth(api, terminalHeight);
+    pruneEmptyDockGroups(api);
     return true;
   } catch {
     localStorage.removeItem(CONSOLE_LAYOUT_STORAGE_KEY);
@@ -740,6 +1154,8 @@ export function loadConsoleSavedLayout(api: DockviewApi): boolean {
 }
 
 export function saveConsoleLayout(api: DockviewApi) {
+  pruneEmptyDockGroups(api);
+  if (!isHealthyConsoleLayout(api)) return;
   localStorage.setItem(CONSOLE_LAYOUT_STORAGE_KEY, JSON.stringify(api.toJSON()));
 }
 

@@ -16,7 +16,10 @@ alwaysApply: true
 ## 工作区快照（切换后保持状态）
 
 - 快照在 `workspaceStore`：`dockJson`、`fileTreePath`、`selectedFile`、`terminalRuntimeById`。
-- 切换前：`captureTerminalRuntimeForConnection` + `captureConnectionWorkspace`。
+- 切换前：`captureTerminalRuntimeForConnection` + `captureConnectionWorkspace`（或切换队列内 `captureConnectionWorkspaceForced`）。
+- `restoreConnectionWorkspace` 须先 `api.clear()` 再 `fromJSON`；恢复后 `pruneEmptyDockGroups` 并回写清理后的快照。
+- 空 group（无面板）会显示为顶部空白区域；捕获快照前须 prune，健康检查须 `groups` 无空项。
+- 已连接时 **不要** 在 `onReady` 里先 `createDefaultLayout` 再 restore。
 - 切换后：`restoreConnectionWorkspace` → `api.fromJSON` + `stampTerminalConnectionId`。
 - 文件树路径：用 effect cleanup 按 `connectionId` 写回，避免切换时把 A 的路径误写到 B。
 - `RemoteFileTree` 的 `key={connectionId}` 会 remount；目录状态靠 `fileTreePath` 快照恢复，展开状态不持久化。
@@ -32,6 +35,14 @@ alwaysApply: true
 - 仅在这些场景销毁 PTY：用户关闭终端标签（`onDidRemovePanel` 非切换中）、`disconnect` / `disconnectAll`。
 - 终端面板 `params` 必须带 `connectionId`；`TerminalPanel` 用 `params.connectionId` 查 `sessions` 得 `sessionId`，**禁止**绑定全局 `sessionId`。
 - `workspaceSwitching` 在 `fromJSON` 完成后再延迟清除（rAF + timeout），避免竞态误销毁。
+
+## 终端 cwd 跟踪与恢复
+
+- cwd 来源：OSC7 输出解析 + 用户输入 `cd` 跟踪（`terminalTracking.ts`），**禁止**在终端运行时周期性调用 `terminal_query_cwd`。
+- `terminal_query_cwd`（`stty`/`__mx_pwd` 探测）**仅**用于用户主动「复制终端」；切换 SSH、断开、退出、定时保存**禁止**调用（会向 PTY 写入 `\n`，切回后像莫名回车）。
+- 探测命令回显必须在 `ssh/pty.rs` 过滤（含 marker 之前的 shell 回显）；改 Rust 后需重启 `tauri dev`。
+- 恢复 `initialCwd` 前用 `sftp_list_dir` 校验路径存在；与 home 相同时不传，避免多余 `cd`。
+- `shouldAcceptCwdUpdate` 拒绝更短路径前缀，防止截断 cwd 被持久化。
 
 ## SSH 连接架构
 

@@ -15,7 +15,8 @@ interface UseAppPersistenceOptions {
   setTransferOpen: (open: boolean) => void;
   setLocalConsoleReady: (ready: boolean) => void;
   saveCurrentDockLayout: () => void;
-  onClose?: () => void;
+  saveCurrentDockLayoutAsync?: () => Promise<void>;
+  onClose?: () => void | Promise<void>;
 }
 
 export function useAppPersistence({
@@ -25,11 +26,17 @@ export function useAppPersistence({
   setTransferOpen,
   setLocalConsoleReady,
   saveCurrentDockLayout,
+  saveCurrentDockLayoutAsync,
   onClose,
 }: UseAppPersistenceOptions) {
   const [restored, setRestored] = useState(false);
-  const latestRef = useRef({ mode, transferOpen, saveCurrentDockLayout });
-  latestRef.current = { mode, transferOpen, saveCurrentDockLayout };
+  const latestRef = useRef({
+    mode,
+    transferOpen,
+    saveCurrentDockLayout,
+    saveCurrentDockLayoutAsync,
+  });
+  latestRef.current = { mode, transferOpen, saveCurrentDockLayout, saveCurrentDockLayoutAsync };
 
   useEffect(() => {
     void restoreAppState({ setMode, setTransferOpen, setLocalConsoleReady }).finally(() => {

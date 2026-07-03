@@ -5,6 +5,8 @@ import type { TerminalMeta } from "../types/connection";
 
 const STORAGE_KEY = "max-terminal-workspace-snapshots-v1";
 
+export const WORKSPACE_SNAPSHOTS_STORAGE_KEY = STORAGE_KEY;
+
 export interface ConnectionWorkspaceSnapshot {
   dockJson: unknown;
   fileTreePath: string | null;
@@ -24,7 +26,10 @@ interface WorkspaceState {
   ) => void;
   removeTerminalRuntime: (connectionId: string, terminalId: string) => void;
   capture: (api: DockviewApi, connectionId: string) => void;
+  captureForced: (api: DockviewApi, connectionId: string) => void;
+  writeSnapshot: (api: DockviewApi, connectionId: string) => void;
   getSnapshot: (connectionId: string) => ConnectionWorkspaceSnapshot | undefined;
+  clearAll: () => void;
   remove: (connectionId: string) => void;
 }
 
@@ -130,15 +135,28 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }),
 
   capture: (api, connectionId) => {
+    const activeConnectionId = useSessionStore.getState().connectionId;
+    // 仅当该连接为当前 UI 激活连接时捕获布局，避免切换竞态写错快照
+    if (activeConnectionId !== connectionId) return;
+
+    get().writeSnapshot(api, connectionId);
+  },
+
+  /** 切换工作区时强制写入（此时 sessionStore 可能已是目标连接，但 api 仍显示来源连接布局） */
+  captureForced: (api, connectionId) => {
+    get().writeSnapshot(api, connectionId);
+  },
+
+  writeSnapshot: (api, connectionId) => {
     const current = get().snapshots[connectionId];
     const fileTreePath = get().getFileTreePath(connectionId) ?? current?.fileTreePath ?? null;
-    const selectedFile = useSessionStore.getState().connectionId === connectionId
-      ? useSessionStore.getState().selectedFile
-      : current?.selectedFile ?? null;
+    const selectedFile =
+      useSessionStore.getState().connectionId === connectionId
+        ? useSessionStore.getState().selectedFile
+        : (current?.selectedFile ?? null);
 
-    set((state) => ({
-      snapshots: (() => {
-        const snapshots = {
+    set((state) => {
+      const snapshots = {
         ...state.snapshots,
         [connectionId]: {
           dockJson: api.toJSON(),
@@ -147,13 +165,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           terminalRuntimeById: current?.terminalRuntimeById ?? {},
         },
       };
-        persistSnapshots(snapshots);
-        return snapshots;
-      })(),
-    }));
+      persistSnapshots(snapshots);
+      return { snapshots };
+    });
   },
 
   getSnapshot: (connectionId) => get().snapshots[connectionId],
+
+  clearAll: () => {
+    persistSnapshots({});
+    set({ snapshots: {} });
+  },
 
   remove: (connectionId) =>
     set((state) => {

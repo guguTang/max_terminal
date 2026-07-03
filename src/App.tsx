@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { RotateCcw, Server, Laptop, X, Eraser } from "lucide-react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ConsoleDockLayout } from "./components/ConsoleDockLayout";
 import { DockLayout } from "./components/DockLayout";
 import { TerminalOutputBridge } from "./components/TerminalOutputBridge";
@@ -9,6 +8,7 @@ import { TransferDrawer } from "./components/TransferDrawer";
 import { TransferRail } from "./components/TransferRail";
 import {
   CONSOLE_LAYOUT_STORAGE_KEY,
+  captureWorkspaceBeforeClose,
   getDockApi,
   LAYOUT_STORAGE_KEY,
   resetConsoleLayout,
@@ -18,11 +18,9 @@ import {
 } from "./layout/dockApi";
 import { useSessionStore } from "./stores/sessionStore";
 import { useConnectionStore } from "./stores/connectionStore";
-import { useWorkspaceStore } from "./stores/workspaceStore";
-import { useTerminalTitleStore } from "./stores/terminalTitleStore";
 import { destroyAllLocalTerminals, useLocalConsoleStore } from "./stores/localConsoleStore";
 import { useAppPersistence } from "./hooks/useAppPersistence";
-import { clearPersistedAppState } from "./lib/appStatePersistence";
+import { clearAllDebugData } from "./lib/clearDebugData";
 
 import { useTransferPolling } from "./hooks/useTransferPolling";
 
@@ -37,19 +35,24 @@ function App() {
     activateSession,
     showSshList,
     disconnect,
-    disconnectAll,
   } = useSessionStore();
   const connections = useConnectionStore((s) => s.connections);
   const [layoutKey, setLayoutKey] = useState(0);
   const [consoleLayoutKey, setConsoleLayoutKey] = useState(0);
   const [resetFeedback, setResetFeedback] = useState(false);
+  const [debugClearFeedback, setDebugClearFeedback] = useState(false);
   const [mode, setMode] = useState<"ssh" | "console">("ssh");
   const [transferOpen, setTransferOpen] = useState(false);
   const setLocalConsoleReady = useLocalConsoleStore((s) => s.setReady);
 
   const saveCurrentDockLayout = () => {
+    void saveCurrentDockLayoutAsync();
+  };
+
+  const saveCurrentDockLayoutAsync = async () => {
     const api = getDockApi();
     if (!api) return;
+    await captureWorkspaceBeforeClose();
     if (mode === "console") {
       saveConsoleLayout(api);
     } else {
@@ -64,9 +67,10 @@ function App() {
     setTransferOpen,
     setLocalConsoleReady,
     saveCurrentDockLayout,
-    onClose: () => {
-      void useSessionStore.getState().disconnectAll();
-      void destroyAllLocalTerminals();
+    saveCurrentDockLayoutAsync,
+    onClose: async () => {
+      await useSessionStore.getState().disconnectAll();
+      await destroyAllLocalTerminals();
     },
   });
 
@@ -89,24 +93,25 @@ function App() {
     window.setTimeout(() => setResetFeedback(false), 1500);
   };
 
-  const handleClearSshState = async () => {
-    await disconnectAll();
-    useWorkspaceStore.setState({ snapshots: {} });
-    useTerminalTitleStore.setState({ titlesByConnection: {} });
-    localStorage.removeItem(LAYOUT_STORAGE_KEY);
-    await clearPersistedAppState();
-    const api = getDockApi();
-    if (api) {
-      resetLayout(api);
-    } else {
-      setLayoutKey((k) => k + 1);
-    }
-    setResetFeedback(true);
-    window.setTimeout(() => setResetFeedback(false), 1500);
+  const handleClearDebugData = async () => {
+    await clearAllDebugData({
+      dockApi: getDockApi(),
+      mode,
+      onLayoutReset: () => {
+        if (mode === "console") {
+          setConsoleLayoutKey((k) => k + 1);
+        } else {
+          setLayoutKey((k) => k + 1);
+        }
+      },
+    });
+    setDebugClearFeedback(true);
+    window.setTimeout(() => setDebugClearFeedback(false), 1500);
   };
 
   const handleSwitchToSsh = () => {
     saveCurrentDockLayout();
+    setLocalConsoleReady(false);
     setMode("ssh");
     showSshList();
   };
@@ -117,31 +122,11 @@ function App() {
     setMode("console");
   };
 
-  const handleDragMouseDown = (event: React.MouseEvent<HTMLElement>) => {
-    if (!isMac || event.button !== 0) return;
-    const target = event.target as HTMLElement | null;
-    if (
-      target?.closest(
-        ".app-no-drag,button,a,input,textarea,select,[role='button'],[data-no-drag='true']",
-      )
-    ) {
-      return;
-    }
-    event.preventDefault();
-    void getCurrentWindow().startDragging().catch((err) => {
-      console.error("startDragging failed:", err);
-    });
-  };
-
   return (
     <div className="h-full flex flex-col bg-zinc-950">
       <TerminalOutputBridge />
-      <header
-        className={`flex items-center gap-3 px-4 py-2 border-b border-zinc-800 bg-zinc-950 shrink-0 ${
-          isMac ? "pl-20" : ""
-        }`}
-        onMouseDown={handleDragMouseDown}
-      >
+      <header className="flex items-center gap-3 px-4 py-2 border-b border-zinc-800 bg-zinc-950 shrink-0">
+        {isMac && <div className="-ml-4 w-20 shrink-0 app-no-drag" aria-hidden />}
         <nav className="flex items-center gap-1 shrink-0 app-no-drag">
           <button
             type="button"
@@ -212,22 +197,25 @@ function App() {
             })}
           </div>
         )}
-        <div className="flex-1 min-w-0" />
+        <div className="flex-1 min-w-0 self-stretch" data-tauri-drag-region />
         <div className="ml-auto flex items-center gap-2 app-no-drag">
           {error && (
             <span className="text-xs text-red-400 truncate max-w-[40vw]">{error}</span>
+          )}
+          {debugClearFeedback && (
+            <span className="text-xs text-emerald-400">调试数据已清空（SSH 连接已保留）</span>
           )}
           {resetFeedback && (
             <span className="text-xs text-emerald-400">布局已重置</span>
           )}
           <button
             type="button"
-            onClick={() => void handleClearSshState()}
+            onClick={() => void handleClearDebugData()}
             className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
-            title="清空所有 SSH 状态（调试用）"
+            title="清空除 SSH 连接（IP/账号/密码）外的所有 DB 与本地状态，便于调试"
           >
             <Eraser size={14} />
-            清空SSH状态
+            清空调试数据
           </button>
           <button
             type="button"

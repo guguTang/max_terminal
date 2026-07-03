@@ -138,6 +138,10 @@ body {
   overflow-y: auto;
 }
 
+.terminal-host .xterm .xterm-selection div {
+  opacity: 0.6;
+}
+
 /* 远程文件树滚动条：深色风格，横向按需显示 */
 .remote-file-tree-scroll {
   scrollbar-width: thin;

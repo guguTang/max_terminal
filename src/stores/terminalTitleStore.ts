@@ -2,6 +2,8 @@ import { create } from "zustand";
 
 const STORAGE_KEY = "max-terminal-terminal-titles-v1";
 
+export const TERMINAL_TITLES_STORAGE_KEY = STORAGE_KEY;
+
 type TitlesByConnection = Record<string, Record<string, string>>;
 
 interface TerminalTitleState {
@@ -10,6 +12,7 @@ interface TerminalTitleState {
   setTitle: (connectionId: string, terminalId: string, title: string) => void;
   removeTerminal: (connectionId: string, terminalId: string) => void;
   clearConnection: (connectionId: string) => void;
+  clearAll: () => void;
 }
 
 function loadInitialState(): TitlesByConnection {
@@ -76,5 +79,10 @@ export const useTerminalTitleStore = create<TerminalTitleState>((set, get) => ({
       persist(next);
       return { titlesByConnection: next };
     }),
+
+  clearAll: () => {
+    persist({});
+    set({ titlesByConnection: {} });
+  },
 }));
 

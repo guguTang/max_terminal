@@ -27,7 +27,7 @@ interface SessionState {
   connectingId: string | null;
   connect: (connectionId: string) => Promise<void>;
   connectBackground: (connectionId: string) => Promise<SshSessionItem>;
-  activateSession: (connectionId: string) => void;
+  activateSession: (connectionId: string) => Promise<void>;
   showSshList: () => void;
   disconnect: (connectionId?: string) => Promise<void>;
   disconnectAll: () => Promise<void>;
@@ -65,12 +65,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   connect: async (connectionId) => {
     const existing = get().sessions.find((s) => s.connectionId === connectionId);
     if (existing) {
-      get().activateSession(connectionId);
+      await get().activateSession(connectionId);
       return;
     }
 
     set({ connecting: true, connectingId: connectionId, error: null });
     try {
+      const prevConnectionId = get().connectionId;
+      const prevSessionId = get().sessionId;
       const result = await invoke<ConnectResult>("connect_ssh", { connectionId });
       const sessions = [
         ...get().sessions.filter((s) => s.connectionId !== result.connectionId),
@@ -80,6 +82,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           homePath: result.homePath,
         },
       ];
+      if (
+        prevConnectionId &&
+        prevSessionId &&
+        prevConnectionId !== result.connectionId
+      ) {
+        const { captureConnectionWorkspaceSnapshot, setWorkspaceSwitching } =
+          await import("../layout/dockApi");
+        setWorkspaceSwitching(true);
+        await captureConnectionWorkspaceSnapshot(prevConnectionId, prevSessionId);
+      }
       set({
         sessions,
         activeSessionId: result.sessionId,
@@ -121,11 +133,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     return item;
   },
 
-  activateSession: (connectionId) => {
+  activateSession: async (connectionId) => {
     const target = get().sessions.find((s) => s.connectionId === connectionId);
     if (!target) return;
 
     const prevConnectionId = get().connectionId;
+    const prevSessionId = get().sessionId;
     if (prevConnectionId === connectionId) {
       set({
         activeSessionId: target.sessionId,
@@ -140,9 +153,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       return;
     }
 
-    void import("../layout/dockApi").then(({ setWorkspaceSwitching }) => {
+    const { captureConnectionWorkspaceSnapshot, setWorkspaceSwitching } =
+      await import("../layout/dockApi");
+    if (prevConnectionId && prevSessionId) {
       setWorkspaceSwitching(true);
-    });
+      await captureConnectionWorkspaceSnapshot(prevConnectionId, prevSessionId);
+    }
 
     set({
       activeSessionId: target.sessionId,

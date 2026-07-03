@@ -4,7 +4,7 @@ mod local;
 mod ssh;
 mod state;
 
-use commands::app_state::{clear_app_state_cmd, get_app_state, save_app_state_cmd};
+use commands::app_state::{clear_app_state_cmd, clear_debug_data_cmd, exit_app, get_app_state, save_app_state_cmd};
 use commands::connection::{
     delete_connection_cmd, list_connections_cmd, save_connection_cmd, test_connection_cmd,
 };
@@ -18,6 +18,7 @@ use commands::terminal::{
     terminal_apply_state, terminal_create, terminal_destroy, terminal_destroy_all_local,
     terminal_get_meta, terminal_input, terminal_query_cwd, terminal_resize, terminal_update_meta,
 };
+use commands::terminal_context::terminal_query_context;
 use state::AppState;
 use tauri::Manager;
 
@@ -40,6 +41,8 @@ pub fn run() {
             get_app_state,
             save_app_state_cmd,
             clear_app_state_cmd,
+            clear_debug_data_cmd,
+            exit_app,
             list_connections_cmd,
             save_connection_cmd,
             delete_connection_cmd,
@@ -65,6 +68,7 @@ pub fn run() {
             terminal_destroy_all_local,
             terminal_get_meta,
             terminal_query_cwd,
+            terminal_query_context,
             terminal_input,
             terminal_resize,
             terminal_update_meta,

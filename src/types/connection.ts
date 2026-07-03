@@ -35,6 +35,10 @@ export interface TerminalOutputEvent {
 export interface TerminalMeta {
   cwd: string;
   env: Record<string, string>;
+  /** precmd OSC7799 推送的 git 分支，null = 明确不在仓库 */
+  precmdGitBranch?: string | null;
+  /** precmd 上报时的 cwd，用于与当前目录绑定 */
+  precmdCwd?: string;
 }
 
 export interface TerminalCreateOptions {
@@ -42,6 +46,38 @@ export interface TerminalCreateOptions {
   initialEnv?: Record<string, string>;
   cols?: number;
   rows?: number;
+}
+
+export type TerminalContextProvider = "git" | "svn" | "k8s" | "pyenv" | "node";
+
+export interface GitContext {
+  branch: string;
+  dirtyCount: number;
+}
+
+export interface SvnContext {
+  branch?: string;
+  dirtyCount: number;
+}
+
+export interface K8sContext {
+  context: string;
+}
+
+export interface PyenvContext {
+  version: string;
+}
+
+export interface NodeContext {
+  version: string;
+}
+
+export interface TerminalContextResult {
+  git?: GitContext;
+  svn?: SvnContext;
+  k8s?: K8sContext;
+  pyenv?: PyenvContext;
+  node?: NodeContext;
 }
 
 export const TEXT_EXTENSIONS = new Set([

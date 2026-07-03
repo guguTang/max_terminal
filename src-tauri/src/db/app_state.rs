@@ -31,6 +31,11 @@ pub fn save_app_state(conn: &Connection, json: &str) -> SqliteResult<()> {
 }
 
 pub fn clear_app_state(conn: &Connection) -> SqliteResult<()> {
+    clear_debug_data(conn)
+}
+
+/// 清空除 `connections` 表外的所有 DB 数据（当前仅 `app_state`）。
+pub fn clear_debug_data(conn: &Connection) -> SqliteResult<()> {
     conn.execute("DELETE FROM app_state WHERE id = 1", [])?;
     Ok(())
 }

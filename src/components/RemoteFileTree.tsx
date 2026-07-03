@@ -15,6 +15,7 @@ import { RemotePathPicker } from "./RemotePathPicker";
 interface TreeNodeProps {
   entry: FileEntry;
   depth: number;
+  sessionId: string | null;
   onSelect: (path: string) => void;
   selectedPath: string | null;
   reloadKey: number;
@@ -90,13 +91,13 @@ type TreeMutation =
 function TreeNode({
   entry,
   depth,
+  sessionId,
   onSelect,
   selectedPath,
   reloadKey,
   onContextMenu,
   mutation,
 }: TreeNodeProps) {
-  const { sessionId } = useSessionStore();
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -240,6 +241,7 @@ function TreeNode({
             key={child.path}
             entry={child}
             depth={depth + 1}
+            sessionId={sessionId}
             onSelect={onSelect}
             selectedPath={selectedPath}
             reloadKey={reloadKey}
@@ -253,11 +255,26 @@ function TreeNode({
 
 interface RemoteFileTreeProps {
   onFileSelect: (path: string) => void;
+  connectionId?: string | null;
+  sessionId?: string | null;
+  homePath?: string | null;
 }
 
-export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
-  const { sessionId, connectionId, connected, selectedFile, homePath, sessions, connectBackground } =
-    useSessionStore();
+export function RemoteFileTree({
+  onFileSelect,
+  connectionId: boundConnectionId,
+  sessionId: boundSessionId,
+  homePath: boundHomePath,
+}: RemoteFileTreeProps) {
+  const activeConnectionId = useSessionStore((s) => s.connectionId);
+  const activeSessionId = useSessionStore((s) => s.sessionId);
+  const activeHomePath = useSessionStore((s) => s.homePath);
+  const { selectedFile, sessions, connectBackground } = useSessionStore();
+  const connectionId = boundConnectionId ?? activeConnectionId;
+  const sessionForConnection = sessions.find((s) => s.connectionId === connectionId);
+  const sessionId = boundSessionId ?? sessionForConnection?.sessionId ?? activeSessionId;
+  const homePath = boundHomePath ?? sessionForConnection?.homePath ?? activeHomePath;
+  const browseGenerationRef = useRef(0);
   const connections = useConnectionStore((s) => s.connections);
   const fetchConnections = useConnectionStore((s) => s.fetchConnections);
   const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -302,6 +319,10 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   }, [connections.length, fetchConnections]);
 
   useEffect(() => {
+    browseGenerationRef.current += 1;
+    setEntries([]);
+    setError(null);
+    setLoading(false);
     if (!connectionId || !homePath) {
       setCurrentPath(null);
       return;
@@ -321,35 +342,37 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
   }, [connectionId, currentPath]);
 
   useEffect(() => {
-    if (!connected || !sessionId || !currentPath) {
+    if (!sessionId || !currentPath) {
       setEntries([]);
       setError(null);
       setLoading(false);
       return;
     }
 
+    const generation = browseGenerationRef.current;
     let cancelled = false;
     setLoading(true);
     setError(null);
 
     invoke<FileEntry[]>("sftp_list_dir", { sessionId, path: currentPath })
       .then((items) => {
-        if (!cancelled) setEntries(items);
+        if (cancelled || generation !== browseGenerationRef.current) return;
+        setEntries(items);
       })
       .catch((e) => {
-        if (!cancelled) {
-          setError(String(e));
-          setEntries([]);
-        }
+        if (cancelled || generation !== browseGenerationRef.current) return;
+        setError(String(e));
+        setEntries([]);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (cancelled || generation !== browseGenerationRef.current) return;
+        setLoading(false);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [connected, sessionId, currentPath, reloadKey]);
+  }, [sessionId, currentPath, reloadKey]);
 
   useEffect(() => {
     const close = () => setMenu(null);
@@ -940,7 +963,7 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
     startUpload,
   ]);
 
-  if (!connected || !homePath || !currentPath) {
+  if (!sessionId || !homePath || !currentPath) {
     return (
       <div className="flex items-center justify-center h-full text-sm text-zinc-500">
         请先连接服务器
@@ -1030,6 +1053,7 @@ export function RemoteFileTree({ onFileSelect }: RemoteFileTreeProps) {
               key={entry.path}
               entry={entry}
               depth={0}
+              sessionId={sessionId}
               onSelect={onFileSelect}
               selectedPath={selectedFile}
               reloadKey={reloadKey}

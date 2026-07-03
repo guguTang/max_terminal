@@ -1,6 +1,7 @@
 use crate::local::LOCAL_SESSION_ID;
 use crate::ssh::pty::{
-    apply_terminal_state, create_terminal, query_cwd, resize_terminal, write_input, TerminalHandle,
+    apply_terminal_state, create_terminal, install_cwd_hook, query_cwd, resize_terminal, write_input,
+    TerminalHandle,
 };
 use crate::ssh::session::SessionInner;
 use crate::ssh::terminal_meta::{is_valid_cwd_path, TerminalMeta};
@@ -157,6 +158,8 @@ pub async fn terminal_create(
             .await
             .map_err(|e| e.to_string())?;
     }
+
+    let _ = install_cwd_hook(&terminal).await;
 
     Ok(())
 }

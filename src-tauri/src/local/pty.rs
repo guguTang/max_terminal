@@ -1,6 +1,9 @@
 use crate::local::{default_home_dir, default_shell, is_valid_local_cwd_path};
 use crate::ssh::pty::TerminalOutputEvent;
-use crate::ssh::terminal_meta::{build_bootstrap_script, is_valid_cwd_path};
+use crate::ssh::terminal_meta::{
+    build_bootstrap_script, build_cwd_hook_install_command, filter_terminal_setup_echo,
+    is_valid_cwd_path, prepare_local_shell_hook, LocalShellHookPaths,
+};
 use anyhow::{anyhow, Result};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
@@ -22,6 +25,7 @@ struct CwdQueryState {
 struct CwdCapture {
     buffer: String,
     pending: Option<CwdQueryState>,
+    hook_installing: bool,
 }
 
 impl CwdCapture {
@@ -29,7 +33,22 @@ impl CwdCapture {
         Self {
             buffer: String::new(),
             pending: None,
+            hook_installing: false,
         }
+    }
+
+    fn begin_hook_install(&mut self) {
+        self.hook_installing = true;
+        self.buffer.clear();
+    }
+
+    fn end_hook_install(&mut self) {
+        self.hook_installing = false;
+        self.buffer.clear();
+    }
+
+    fn is_hook_installing(&self) -> bool {
+        self.hook_installing
     }
 
     fn begin_query(&mut self, token: &str, tx: oneshot::Sender<String>) {
@@ -45,12 +64,21 @@ impl CwdCapture {
     }
 
     fn process_chunk(&mut self, chunk: &str) -> String {
+        if self.hook_installing {
+            self.buffer.push_str(chunk);
+            if self.buffer.contains("__MX_HOOK_OK__") || self.buffer.contains("\x1b]7;file://") || self.buffer.contains("\x1b]7799;") {
+                self.hook_installing = false;
+                self.buffer.clear();
+            }
+            return String::new();
+        }
+
         self.buffer.push_str(chunk);
         let mut display = String::new();
 
         loop {
             let Some(pending) = self.pending.as_ref() else {
-                display.push_str(&self.buffer);
+                display.push_str(&filter_terminal_setup_echo(&self.buffer));
                 self.buffer.clear();
                 break;
             };
@@ -61,18 +89,20 @@ impl CwdCapture {
             let Some(start) = self.buffer.find(&start_marker) else {
                 let keep = partial_prefix_overlap(&self.buffer, &start_marker);
                 if keep == 0 {
-                    display.push_str(&self.buffer);
+                    let flushed = filter_terminal_setup_echo(&self.buffer);
+                    display.push_str(&flushed);
                     self.buffer.clear();
                 } else if self.buffer.len() > keep {
                     let flush_end = self.buffer.len() - keep;
-                    display.push_str(&self.buffer[..flush_end]);
+                    let flushed = filter_terminal_setup_echo(&self.buffer[..flush_end]);
+                    display.push_str(&flushed);
                     self.buffer = self.buffer[flush_end..].to_string();
                 }
                 break;
             };
 
             if start > 0 {
-                display.push_str(&self.buffer[..start]);
+                display.push_str(&filter_terminal_setup_echo(&self.buffer[..start]));
             }
 
             let after_start = &self.buffer[start + start_marker.len()..];
@@ -120,9 +150,14 @@ pub struct LocalTerminalHandle {
     writer_alive: Arc<AtomicBool>,
     cwd_capture: Arc<Mutex<CwdCapture>>,
     shell_ready: Arc<Notify>,
+    shell_hook_at_spawn: bool,
+    hook_paths: Mutex<Option<LocalShellHookPaths>>,
 }
 
 impl LocalTerminalHandle {
+    pub fn shell_hook_at_spawn(&self) -> bool {
+        self.shell_hook_at_spawn
+    }
     pub fn is_alive(&self) -> bool {
         if !self.writer_alive.load(Ordering::SeqCst) {
             return false;
@@ -155,6 +190,11 @@ impl LocalTerminalHandle {
             }
         }
         self.writer_alive.store(false, Ordering::SeqCst);
+        if let Ok(mut paths) = self.hook_paths.lock() {
+            if let Some(p) = paths.take() {
+                p.cleanup();
+            }
+        }
     }
 }
 
@@ -174,7 +214,7 @@ pub async fn query_cwd(terminal: &LocalTerminalHandle) -> Result<String> {
     );
     write_input(terminal, &cmd).await?;
 
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    let result = match tokio::time::timeout(Duration::from_secs(5), rx).await {
         Ok(Ok(path)) if is_valid_local_cwd_path(&path) => Ok(path),
         Ok(Ok(_)) => {
             terminal.cwd_capture.lock().unwrap().clear_pending();
@@ -188,7 +228,9 @@ pub async fn query_cwd(terminal: &LocalTerminalHandle) -> Result<String> {
             terminal.cwd_capture.lock().unwrap().clear_pending();
             Err(anyhow!("CWD query timed out"))
         }
-    }
+    };
+
+    result
 }
 
 pub async fn apply_terminal_state(
@@ -212,6 +254,37 @@ pub async fn apply_terminal_state(
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     write_input(terminal, &script).await
+}
+
+pub async fn install_cwd_hook(terminal: &LocalTerminalHandle) -> Result<()> {
+    match tokio::time::timeout(Duration::from_secs(8), terminal.shell_ready.notified()).await {
+        Ok(()) => {}
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    {
+        let mut guard = terminal.cwd_capture.lock().unwrap();
+        guard.begin_hook_install();
+    }
+    write_input(terminal, &build_cwd_hook_install_command()).await?;
+    for _ in 0..150 {
+        let done = {
+            let guard = terminal.cwd_capture.lock().unwrap();
+            !guard.is_hook_installing()
+        };
+        if done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    {
+        let mut guard = terminal.cwd_capture.lock().unwrap();
+        guard.end_hook_install();
+    }
+    Ok(())
 }
 
 fn spawn_writer_thread(
@@ -293,12 +366,30 @@ fn spawn_reader_thread(
     })
 }
 
-fn configure_shell_command(shell: &str) -> CommandBuilder {
+fn configure_shell_command(
+    shell: &str,
+    home: &str,
+) -> Result<(CommandBuilder, Option<LocalShellHookPaths>)> {
     let mut cmd = CommandBuilder::new(shell);
-    cmd.arg("-i");
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd
+
+    let hook_paths = prepare_local_shell_hook(shell, home)?;
+    if let Some(ref paths) = hook_paths {
+        if let Some(ref zdot) = paths.zdotdir {
+            cmd.env("ZDOTDIR", zdot.to_string_lossy().as_ref());
+            cmd.arg("-i");
+        } else if let Some(ref rc) = paths.bash_rc {
+            cmd.arg("--rcfile");
+            cmd.arg(rc);
+            cmd.arg("-i");
+        } else {
+            cmd.arg("-i");
+        }
+    } else {
+        cmd.arg("-i");
+    }
+    Ok((cmd, hook_paths))
 }
 
 pub async fn create_local_terminal(
@@ -325,7 +416,8 @@ pub async fn create_local_terminal(
         })
         .map_err(|e| anyhow!("Failed to open local PTY: {e}"))?;
 
-    let mut cmd = configure_shell_command(&shell);
+    let (mut cmd, hook_paths) = configure_shell_command(&shell, &home)?;
+    let shell_hook_at_spawn = hook_paths.is_some();
 
     let spawn_cwd = initial_cwd
         .as_ref()
@@ -388,6 +480,8 @@ pub async fn create_local_terminal(
         writer_alive,
         cwd_capture,
         shell_ready,
+        shell_hook_at_spawn,
+        hook_paths: Mutex::new(hook_paths),
     })
 }
 

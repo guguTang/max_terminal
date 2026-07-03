@@ -1,6 +1,6 @@
 use crate::local::pty::{
-    apply_terminal_state, create_local_terminal, query_cwd, resize_terminal, write_input,
-    LocalTerminalHandle,
+    apply_terminal_state, create_local_terminal, install_cwd_hook, query_cwd, resize_terminal,
+    write_input, LocalTerminalHandle,
 };
 use crate::local::{default_home_dir, is_valid_local_cwd_path, LOCAL_SESSION_ID};
 use crate::ssh::terminal_meta::TerminalMeta;
@@ -81,6 +81,10 @@ impl LocalTerminalManager {
             apply_terminal_state(&terminal, cwd, &initial_env)
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+
+        if !terminal.shell_hook_at_spawn() {
+            let _ = install_cwd_hook(&terminal).await;
         }
 
         Ok(terminal)
