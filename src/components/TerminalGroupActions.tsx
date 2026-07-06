@@ -24,7 +24,7 @@ export function TerminalGroupActions({
       title="新建终端"
       onClick={() => addNewTerminal(containerApi)}
     >
-      <Plus size={14} />
+      <Plus size={16} strokeWidth={2} />
     </button>
   );
 }

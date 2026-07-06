@@ -85,30 +85,51 @@ body {
 
 .max-terminal-dockview .dv-default-tab .dv-default-tab-action {
   display: flex;
+  cursor: default;
+}
+
+.max-terminal-dockview .dv-left-actions-container {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  flex-shrink: 0;
+  padding: 0 6px 0 4px;
+}
+
+.max-terminal-dockview .dv-left-actions-container .dv-react-part {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  width: auto;
 }
 
 .max-terminal-dockview .terminal-tab-add-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 30px;
-  height: 26px;
-  margin: 0 0 0 2px;
-  padding: 0 8px;
-  border: 1px solid #27272a;
-  border-radius: 8px 8px 0 0;
-  border-bottom-color: transparent;
-  background: #0f0f12;
-  color: #71717a;
-  cursor: pointer;
-  transform: translateY(1px);
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #52525b;
+  cursor: default;
+  flex-shrink: 0;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease;
 }
 
 .max-terminal-dockview .terminal-tab-add-btn:hover {
-  background: #18181b;
+  background: rgba(255, 255, 255, 0.08);
+  color: #a1a1aa;
+}
+
+.max-terminal-dockview .terminal-tab-add-btn:active {
   color: #e4e4e7;
-  border-color: #3f3f46;
-  border-bottom-color: transparent;
 }
 
 /* 拖拽到布局外边缘时的放置提示（底部全宽停靠） */

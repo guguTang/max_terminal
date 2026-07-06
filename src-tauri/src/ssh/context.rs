@@ -2,7 +2,7 @@ use crate::local::LOCAL_SESSION_ID;
 use crate::ssh::exec::{run_remote_command_with_output, shell_quote};
 use crate::ssh::session::SharedSession;
 use crate::ssh::sftp::read_file;
-use crate::ssh::terminal_meta::{is_valid_cwd_path, normalize_cwd_path};
+use crate::ssh::terminal_meta::normalize_cwd_path;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

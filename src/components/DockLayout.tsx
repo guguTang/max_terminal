@@ -165,7 +165,7 @@ export function DockLayout({ layoutKey }: DockLayoutProps) {
         size: { type: "percentage", value: 18 },
         activationSize: { type: "pixels", value: 48 },
       }}
-      prefixHeaderActionsComponent={TerminalGroupActions}
+      leftHeaderActionsComponent={TerminalGroupActions}
       defaultTabComponent={EditableDockTab}
       getTabContextMenuItems={getTerminalTabContextMenuItems}
     />

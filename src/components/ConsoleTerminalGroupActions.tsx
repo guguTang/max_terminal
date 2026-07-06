@@ -24,7 +24,7 @@ export function ConsoleTerminalGroupActions({
       title="新建终端"
       onClick={() => addConsoleTerminal(containerApi)}
     >
-      <Plus size={14} />
+      <Plus size={16} strokeWidth={2} />
     </button>
   );
 }

@@ -87,7 +87,7 @@ export function ConsoleDockLayout({ layoutKey }: ConsoleDockLayoutProps) {
         size: { type: "percentage", value: 18 },
         activationSize: { type: "pixels", value: 48 },
       }}
-      prefixHeaderActionsComponent={ConsoleTerminalGroupActions}
+      leftHeaderActionsComponent={ConsoleTerminalGroupActions}
       defaultTabComponent={EditableDockTab}
       getTabContextMenuItems={getConsoleTerminalTabContextMenuItems}
     />
