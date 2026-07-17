@@ -12,6 +12,7 @@ import { ctxLog } from "../lib/terminalContextDebug";
 import {
   Osc7CwdParser,
   PrecmdMetaParser,
+  consumeDockerLeaveMarker,
   shouldAcceptCwdUpdate,
   stripOsc7799,
   TerminalInputTracker,
@@ -30,6 +31,9 @@ interface TerminalProps {
   connectionHomePath?: string | null;
   initialCwd?: string;
   initialEnv?: Record<string, string>;
+  /** 终端就绪后自动执行一次（如 docker exec），不会重复发送 */
+  initialCommand?: string;
+  onInitialCommandConsumed?: () => void;
   /** 来自工作区快照的路径，恢复时跳过 SFTP 存在性校验（避免刚连上时误丢弃） */
   trustInitialCwd?: boolean;
 }
@@ -91,6 +95,8 @@ export function Terminal({
   connectionHomePath,
   initialCwd,
   initialEnv,
+  initialCommand,
+  onInitialCommandConsumed,
   trustInitialCwd = false,
 }: TerminalProps) {
   const isLocal = kind === "local";
@@ -102,6 +108,8 @@ export function Terminal({
   const termRef = useRef<XTerm | null>(null);
   const initialCwdRef = useRef(initialCwd);
   const initialEnvRef = useRef(initialEnv);
+  const initialCommandRef = useRef(initialCommand);
+  const onInitialCommandConsumedRef = useRef(onInitialCommandConsumed);
   const cwdRef = useRef(initialCwdRef.current ?? resolvedHomePath ?? "/");
   const homePathRef = useRef(resolvedHomePath);
   const inputTrackerRef = useRef(new TerminalInputTracker());
@@ -116,6 +124,8 @@ export function Terminal({
   homePathRef.current = resolvedHomePath;
   initialCwdRef.current = initialCwd ?? initialCwdRef.current;
   initialEnvRef.current = initialEnv ?? initialEnvRef.current;
+  initialCommandRef.current = initialCommand ?? initialCommandRef.current;
+  onInitialCommandConsumedRef.current = onInitialCommandConsumed;
   if (!cwdRef.current && resolvedHomePath) {
     cwdRef.current = resolvedHomePath;
   }
@@ -226,17 +236,23 @@ export function Terminal({
     const handleOutput = (data: string) => {
       if (isStale()) return;
 
-      const cwdFromOutput = oscParserRef.current.feed(data);
+      const { cleaned: withoutDockerLeave, left: dockerLeft } =
+        consumeDockerLeaveMarker(data);
+      if (dockerLeft) {
+        applyEnvPatch({ unsetEnv: ["MX_DOCKER_CONTAINER", "MX_DOCKER_ID"] });
+      }
+
+      const cwdFromOutput = oscParserRef.current.feed(withoutDockerLeave);
       if (cwdFromOutput) {
         applyOsc7Cwd(cwdFromOutput);
       }
 
-      const precmdMeta = precmdParserRef.current.feed(data);
+      const precmdMeta = precmdParserRef.current.feed(withoutDockerLeave);
       if (precmdMeta?.env || precmdMeta?.unsetEnv?.length) {
         applyEnvPatch(precmdMeta);
       }
 
-      term.write(stripOsc7799(data));
+      term.write(stripOsc7799(withoutDockerLeave));
       outputStore.ackDisplayed(boundSessionId, terminalId, data.length);
     };
 
@@ -248,15 +264,20 @@ export function Terminal({
 
     const undisplayed = outputStore.takeUndisplayedOutput(boundSessionId, terminalId);
     if (undisplayed) {
-      const cwdFromReplay = oscParserRef.current.feed(undisplayed);
+      const { cleaned: withoutDockerLeave, left: dockerLeft } =
+        consumeDockerLeaveMarker(undisplayed);
+      if (dockerLeft) {
+        applyEnvPatch({ unsetEnv: ["MX_DOCKER_CONTAINER", "MX_DOCKER_ID"] });
+      }
+      const cwdFromReplay = oscParserRef.current.feed(withoutDockerLeave);
       if (cwdFromReplay) {
         applyOsc7Cwd(cwdFromReplay);
       }
-      const precmdFromReplay = precmdParserRef.current.feed(undisplayed);
+      const precmdFromReplay = precmdParserRef.current.feed(withoutDockerLeave);
       if (precmdFromReplay?.env || precmdFromReplay?.unsetEnv?.length) {
         applyEnvPatch(precmdFromReplay);
       }
-      term.write(stripOsc7799(undisplayed));
+      term.write(stripOsc7799(withoutDockerLeave));
     }
 
     let onDataDispose: (() => void) | null = null;
@@ -392,6 +413,24 @@ export function Terminal({
         await syncPtySize(term, fit, boundSessionId, terminalId, true);
         if (isStale()) return;
         scheduleSizeSync();
+
+        const bootstrapCommand = initialCommandRef.current?.trim();
+        if (bootstrapCommand) {
+          initialCommandRef.current = undefined;
+          onInitialCommandConsumedRef.current?.();
+          const payload = bootstrapCommand.endsWith("\n")
+            ? bootstrapCommand
+            : `${bootstrapCommand}\n`;
+          const timer = window.setTimeout(() => {
+            if (isStale() || !ptyReadyRef.current) return;
+            invoke("terminal_input", {
+              sessionId: boundSessionId,
+              data: payload,
+              terminalId,
+            }).catch(console.error);
+          }, 450);
+          syncTimers.push(timer);
+        }
 
         if (hasCloneState && createInitialCwd) {
           cwdRef.current = createInitialCwd;

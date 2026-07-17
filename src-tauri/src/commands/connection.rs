@@ -21,6 +21,14 @@ pub fn save_connection_cmd(
         connection.id = new_connection_id();
         connection.created_at = now_timestamp();
     }
+    if let Some(group) = connection.group_name.as_mut() {
+        let trimmed = group.trim();
+        if trimmed.is_empty() {
+            connection.group_name = None;
+        } else {
+            *group = trimmed.to_string();
+        }
+    }
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     save_connection(&conn, &connection).map_err(|e| e.to_string())?;
     Ok(connection)

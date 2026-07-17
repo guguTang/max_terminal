@@ -11,7 +11,7 @@ import { trackedPathsEqual, normalizeTrackedCwdPath } from "../lib/terminalTrack
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
 import type { TerminalContextResult } from "../types/connection";
 
-const FULL_PROVIDERS = ["git", "svn", "k8s", "pyenv", "node"] as const;
+const FULL_PROVIDERS = ["git", "svn", "k8s", "pyenv", "node", "docker"] as const;
 const GIT_DIRTY_PROVIDERS = ["git_dirty"] as const;
 const GIT_DIRTY_POLL_MS = 15_000;
 const GIT_DIRTY_DEBOUNCE_MS = 600;
@@ -307,10 +307,17 @@ export function useTerminalContext(
   const condaEnv = env.CONDA_DEFAULT_ENV?.trim() || null;
   const virtualEnv = env.VIRTUAL_ENV?.trim() || null;
   const pyenvFromEnv = env.PYENV_VERSION?.trim() || null;
+  const dockerFromEnv = env.MX_DOCKER_CONTAINER?.trim() || null;
+  const dockerIdFromEnv = env.MX_DOCKER_ID?.trim() || null;
   const nodeVersion =
     sanitizeVersionLabel(env.NVM_ACTIVE_VERSION) ??
     sanitizeVersionLabel(scopedRemote.node?.version) ??
     null;
+
+  const docker =
+    dockerFromEnv
+      ? { name: dockerFromEnv, id: dockerIdFromEnv ?? undefined }
+      : scopedRemote.docker;
 
   const git =
     gitBranch != null && gitBranch !== ""
@@ -329,6 +336,7 @@ export function useTerminalContext(
     virtualEnv,
     pyenvFromEnv,
     nodeVersion,
+    docker,
     remote: scopedRemote,
     git,
     refreshContext: () => fetchRemote(FULL_PROVIDERS),

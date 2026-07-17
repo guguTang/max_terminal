@@ -24,7 +24,6 @@ function FilesPanel(props: IDockviewPanelProps<{ connectionId?: string }>) {
   return (
     <div className="h-full min-h-0 overflow-hidden">
       <RemoteFileTree
-        key={connectionId ?? "disconnected"}
         connectionId={connectionId}
         sessionId={session?.sessionId ?? null}
         homePath={session?.homePath ?? null}
@@ -65,6 +64,7 @@ function TerminalPanel(
     workspaceKind?: "local";
     initialCwd?: string;
     initialEnv?: Record<string, string>;
+    initialCommand?: string;
   }>,
 ) {
   const terminalId = props.params?.terminalId ?? "main";
@@ -112,6 +112,7 @@ function TerminalPanel(
   const restoreCwd =
     savedCwd && savedCwd !== homePath ? savedCwd : props.params?.initialCwd;
   const restoreEnv = props.params?.initialEnv ?? snapshotRuntime?.env;
+  const initialCommand = props.params?.initialCommand;
 
   return (
     <div className="h-full min-h-0 overflow-hidden">
@@ -122,6 +123,13 @@ function TerminalPanel(
         connectionHomePath={homePath}
         initialCwd={restoreCwd}
         initialEnv={restoreEnv}
+        initialCommand={initialCommand}
+        onInitialCommandConsumed={() => {
+          props.api.updateParameters({
+            ...(props.params ?? {}),
+            initialCommand: undefined,
+          });
+        }}
         trustInitialCwd={Boolean(restoreCwd)}
       />
     </div>

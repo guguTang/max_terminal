@@ -763,18 +763,25 @@ export function addNewTerminal(
   api: DockviewApi,
   sourceTerminalId?: string,
   cloneMeta?: TerminalMeta,
-) {
+  extras?: { initialCommand?: string; title?: string },
+): string {
   const terminalId = nextTerminalId(api);
   const existingTerminal =
     api.panels.find((p) => p.id.startsWith("terminal")) ?? api.getPanel("terminal");
 
+  const connectionId = useSessionStore.getState().connectionId;
+  if (extras?.title && connectionId) {
+    useTerminalTitleStore.getState().setTitle(connectionId, terminalId, extras.title);
+  }
+
   const panel = api.addPanel({
     id: terminalPanelId(terminalId),
     component: "terminal",
-    title: resolveTerminalTitle(terminalId, sourceTerminalId),
+    title: extras?.title ?? resolveTerminalTitle(terminalId, sourceTerminalId),
     params: terminalParams(terminalId, {
       initialCwd: cloneMeta?.cwd,
       initialEnv: cloneMeta?.env,
+      ...(extras?.initialCommand ? { initialCommand: extras.initialCommand } : {}),
     }),
     position: existingTerminal
       ? { referencePanel: existingTerminal.id, direction: "within" }
@@ -784,10 +791,10 @@ export function addNewTerminal(
   });
   panel.api.setActive();
 
-  const connectionId = useSessionStore.getState().connectionId;
   if (connectionId) {
     captureConnectionWorkspace(api, connectionId);
   }
+  return terminalId;
 }
 
 export async function duplicateTerminal(

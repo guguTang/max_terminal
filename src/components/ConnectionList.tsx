@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Plus,
   Server,
@@ -8,11 +8,41 @@ import {
   PlugZap,
   Unplug,
   Loader2,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import type { Connection } from "../types/connection";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useSessionStore } from "../stores/sessionStore";
 import { ConnectionDialog } from "./ConnectionDialog";
+
+const UNGROUPED_KEY = "";
+const UNGROUPED_LABEL = "未分组";
+const COLLAPSED_GROUPS_STORAGE_KEY = "max-terminal-connection-groups-collapsed-v1";
+
+function loadCollapsedGroups(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_GROUPS_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((item): item is string => typeof item === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistCollapsedGroups(collapsed: Set<string>) {
+  try {
+    localStorage.setItem(COLLAPSED_GROUPS_STORAGE_KEY, JSON.stringify([...collapsed]));
+  } catch {
+    // ignore
+  }
+}
+
+function groupKeyOf(conn: Connection) {
+  return conn.group?.trim() || UNGROUPED_KEY;
+}
 
 export function ConnectionList() {
   const { connections, fetchConnections, saveConnection, deleteConnection, error: storeError } =
@@ -30,10 +60,36 @@ export function ConnectionList() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Connection | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
 
   useEffect(() => {
     fetchConnections();
   }, [fetchConnections]);
+
+  const existingGroups = useMemo(() => {
+    const names = new Set<string>();
+    for (const conn of connections) {
+      const name = conn.group?.trim();
+      if (name) names.add(name);
+    }
+    return [...names].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  }, [connections]);
+
+  const groupedConnections = useMemo(() => {
+    const map = new Map<string, Connection[]>();
+    for (const conn of connections) {
+      const key = groupKeyOf(conn);
+      const list = map.get(key);
+      if (list) list.push(conn);
+      else map.set(key, [conn]);
+    }
+    const named = [...map.entries()]
+      .filter(([key]) => key !== UNGROUPED_KEY)
+      .sort(([a], [b]) => a.localeCompare(b, "zh-CN"));
+    const ungrouped = map.get(UNGROUPED_KEY);
+    if (ungrouped) named.push([UNGROUPED_KEY, ungrouped]);
+    return named;
+  }, [connections]);
 
   const openNewDialog = () => {
     setEditing(null);
@@ -65,9 +121,123 @@ export function ConnectionList() {
     setEditing(null);
   };
 
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      persistCollapsedGroups(next);
+      return next;
+    });
+  };
+
   const displayError = localError || sessionError || storeError;
   const sshViewMode = useSessionStore((s) => s.sshViewMode);
   const isFullscreen = sshViewMode === "list";
+
+  const renderConnectionRow = (conn: Connection) => {
+    const isActive = connectionId === conn.id;
+    const isConnected = sessions.some((s) => s.connectionId === conn.id);
+    const isConnecting = connectingId === conn.id && connecting;
+    return (
+      <div
+        key={conn.id}
+        role="button"
+        tabIndex={0}
+        title="双击连接并打开"
+        onDoubleClick={() => {
+          if (isConnecting) return;
+          void handleConnect(conn);
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter" || isConnecting) return;
+          void handleConnect(conn);
+        }}
+        className={`group flex items-center gap-2 px-3 py-2 border-b border-zinc-900 cursor-pointer hover:bg-zinc-900 ${
+          isActive ? "bg-zinc-900 border-l-2 border-l-blue-500" : ""
+        }`}
+      >
+        <Server size={14} className="text-zinc-500 shrink-0" />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm truncate">{conn.name}</div>
+          <div className="text-xs text-zinc-500 truncate">
+            {conn.username}@{conn.host}:{conn.port}
+          </div>
+        </div>
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
+          {!isConnected && (
+            <button
+              type="button"
+              onClick={async (e) => {
+                e.stopPropagation();
+                await handleConnect(conn);
+              }}
+              className="p-1 rounded hover:bg-zinc-800 text-zinc-300"
+              title="连接"
+            >
+              <Plug size={12} />
+            </button>
+          )}
+          {isConnected && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                activateSession(conn.id);
+              }}
+              className="p-1 rounded hover:bg-zinc-800 text-emerald-400"
+              title="切换到此连接"
+            >
+              <PlugZap size={12} />
+            </button>
+          )}
+          {isConnected && (
+            <button
+              type="button"
+              onClick={async (e) => {
+                e.stopPropagation();
+                await disconnect(conn.id);
+              }}
+              className="p-1 rounded hover:bg-zinc-800 text-amber-300"
+              title="断开连接"
+            >
+              <Unplug size={12} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              openEditDialog(conn);
+            }}
+            className="p-1 rounded hover:bg-zinc-800 text-zinc-400"
+          >
+            <Pencil size={12} />
+          </button>
+          <button
+            type="button"
+            onClick={async (e) => {
+              e.stopPropagation();
+              if (isConnected) await disconnect(conn.id);
+              await deleteConnection(conn.id);
+            }}
+            className="p-1 rounded hover:bg-zinc-800 text-red-400"
+          >
+            <Trash2 size={12} />
+          </button>
+        </div>
+        {isConnecting ? (
+          <Loader2 size={14} className="animate-spin text-blue-400 shrink-0" />
+        ) : isActive ? (
+          <PlugZap size={14} className="text-green-400 shrink-0" />
+        ) : isConnected ? (
+          <Plug size={14} className="text-emerald-500 shrink-0" />
+        ) : (
+          <Plug size={14} className="text-zinc-500 shrink-0" />
+        )}
+      </div>
+    );
+  };
 
   return (
     <>
@@ -105,95 +275,25 @@ export function ConnectionList() {
               <span className="text-sm">添加第一个连接</span>
             </button>
           )}
-          {connections.map((conn) => {
-            const isActive = connectionId === conn.id;
-            const isConnected = sessions.some((s) => s.connectionId === conn.id);
-            const isConnecting = connectingId === conn.id && connecting;
+          {groupedConnections.map(([groupKey, items]) => {
+            const label = groupKey === UNGROUPED_KEY ? UNGROUPED_LABEL : groupKey;
+            const collapsed = collapsedGroups.has(groupKey);
             return (
-              <div
-                key={conn.id}
-                className={`group flex items-center gap-2 px-3 py-2 border-b border-zinc-900 hover:bg-zinc-900 ${
-                  isActive ? "bg-zinc-900 border-l-2 border-l-blue-500" : ""
-                }`}
-              >
-                <Server size={14} className="text-zinc-500 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm truncate">{conn.name}</div>
-                  <div className="text-xs text-zinc-500 truncate">
-                    {conn.username}@{conn.host}:{conn.port}
-                  </div>
-                </div>
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
-                  {!isConnected && (
-                    <button
-                      type="button"
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        await handleConnect(conn);
-                      }}
-                      className="p-1 rounded hover:bg-zinc-800 text-zinc-300"
-                      title="连接"
-                    >
-                      <Plug size={12} />
-                    </button>
+              <div key={groupKey || "__ungrouped"} className="border-b border-zinc-900">
+                <button
+                  type="button"
+                  onClick={() => toggleGroup(groupKey)}
+                  className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs font-medium text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                >
+                  {collapsed ? (
+                    <ChevronRight size={13} className="shrink-0" />
+                  ) : (
+                    <ChevronDown size={13} className="shrink-0" />
                   )}
-                  {isConnected && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        activateSession(conn.id);
-                      }}
-                      className="p-1 rounded hover:bg-zinc-800 text-emerald-400"
-                      title="切换到此连接"
-                    >
-                      <PlugZap size={12} />
-                    </button>
-                  )}
-                  {isConnected && (
-                    <button
-                      type="button"
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        await disconnect(conn.id);
-                      }}
-                      className="p-1 rounded hover:bg-zinc-800 text-amber-300"
-                      title="断开连接"
-                    >
-                      <Unplug size={12} />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openEditDialog(conn);
-                    }}
-                    className="p-1 rounded hover:bg-zinc-800 text-zinc-400"
-                  >
-                    <Pencil size={12} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      if (isConnected) await disconnect(conn.id);
-                      await deleteConnection(conn.id);
-                    }}
-                    className="p-1 rounded hover:bg-zinc-800 text-red-400"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-                {isConnecting ? (
-                  <Loader2 size={14} className="animate-spin text-blue-400 shrink-0" />
-                ) : isActive ? (
-                  <PlugZap size={14} className="text-green-400 shrink-0" />
-                ) : isConnected ? (
-                  <Plug size={14} className="text-emerald-500 shrink-0" />
-                ) : (
-                  <Plug size={14} className="text-zinc-500 shrink-0" />
-                )}
+                  <span className="truncate">{label}</span>
+                  <span className="ml-auto tabular-nums text-zinc-600">{items.length}</span>
+                </button>
+                {!collapsed && items.map((conn) => renderConnectionRow(conn))}
               </div>
             );
           })}
@@ -203,6 +303,7 @@ export function ConnectionList() {
       <ConnectionDialog
         open={dialogOpen}
         initial={editing}
+        existingGroups={existingGroups}
         onSave={handleSave}
         onClose={() => {
           setDialogOpen(false);

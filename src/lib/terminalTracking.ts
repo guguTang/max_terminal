@@ -20,6 +20,28 @@ export function stripOsc7799(data: string): string {
   return data.replace(OSC7799_COMPLETE_RE, "");
 }
 
+/** Printed on its own line after `docker exec` returns; clears sticky docker chip. */
+export const MX_DOCKER_LEAVE_MARKER = "__MX_DOCKER_LEAVE__";
+
+/**
+ * Detect leave marker as a standalone output line (not mid-line command echo).
+ * Returns display data with the marker line removed.
+ */
+export function consumeDockerLeaveMarker(data: string): {
+  cleaned: string;
+  left: boolean;
+} {
+  let left = false;
+  const cleaned = data.replace(
+    /(^|\r?\n)([ \t]*__MX_DOCKER_LEAVE__[ \t]*)(?=\r?\n|$)/g,
+    (_match, lead: string) => {
+      left = true;
+      return lead;
+    },
+  );
+  return { cleaned, left };
+}
+
 function parsePrecmdMetaBody(body: string): PrecmdMetaPatch {
   const env: Record<string, string> = {};
   const unsetEnv: string[] = [];
@@ -51,6 +73,16 @@ function parsePrecmdMetaBody(body: string): PrecmdMetaPatch {
       }
       case "git":
         precmdGitBranch = value || null;
+        break;
+      case "docker":
+        // Enter via panel sets MX_DOCKER_*; leave emits docker= to clear the chip.
+        if (value) {
+          const [name, id] = value.split(",", 2);
+          if (name) env.MX_DOCKER_CONTAINER = name;
+          if (id) env.MX_DOCKER_ID = id;
+        } else {
+          unsetEnv.push("MX_DOCKER_CONTAINER", "MX_DOCKER_ID");
+        }
         break;
       default:
         break;

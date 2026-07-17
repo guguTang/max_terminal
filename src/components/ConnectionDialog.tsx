@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Eye, EyeOff, FlaskConical, X } from "lucide-react";
+import { ChevronDown, Eye, EyeOff, FlaskConical, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthType, Connection } from "../types/connection";
 
@@ -13,12 +13,14 @@ const emptyConnection = (): Connection => ({
   authType: "password",
   password: "",
   privateKey: "",
+  group: "",
   createdAt: 0,
 });
 
 interface ConnectionDialogProps {
   open: boolean;
   initial?: Connection | null;
+  existingGroups?: string[];
   onSave: (conn: Connection) => Promise<void>;
   onClose: () => void;
 }
@@ -26,6 +28,7 @@ interface ConnectionDialogProps {
 export function ConnectionDialog({
   open,
   initial,
+  existingGroups = [],
   onSave,
   onClose,
 }: ConnectionDialogProps) {
@@ -35,7 +38,9 @@ export function ConnectionDialog({
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const groupFieldRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) {
@@ -43,17 +48,41 @@ export function ConnectionDialog({
       setError(null);
       setTestMessage(null);
       setShowPassword(false);
+      setGroupMenuOpen(false);
     }
   }, [open, initial]);
 
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (groupMenuOpen) {
+        e.stopPropagation();
+        setGroupMenuOpen(false);
+        return;
+      }
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, onClose, groupMenuOpen]);
+
+  useEffect(() => {
+    if (!groupMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (!groupFieldRef.current?.contains(e.target as Node)) {
+        setGroupMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    return () => window.removeEventListener("mousedown", onPointerDown);
+  }, [groupMenuOpen]);
+
+  const filteredGroups = useMemo(() => {
+    const q = (form.group ?? "").trim().toLowerCase();
+    if (!q) return existingGroups;
+    return existingGroups.filter((name) => name.toLowerCase().includes(q));
+  }, [existingGroups, form.group]);
 
   const update = <K extends keyof Connection>(key: K, value: Connection[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -64,7 +93,11 @@ export function ConnectionDialog({
     setSaving(true);
     setError(null);
     try {
-      await onSave(form);
+      const group = form.group?.trim();
+      await onSave({
+        ...form,
+        group: group ? group : undefined,
+      });
       onClose();
     } catch (err) {
       setError(String(err));
@@ -156,6 +189,73 @@ export function ConnectionDialog({
               autoFocus
             />
           </label>
+
+          <div className="block space-y-1" ref={groupFieldRef}>
+            <span className="text-xs text-zinc-400">分组</span>
+            <div className="relative">
+              <input
+                className="w-full rounded-lg bg-zinc-950 border border-zinc-700 px-3 py-2 pr-9 text-sm focus:border-blue-500 focus:outline-none"
+                placeholder="可选，如 生产 / 测试"
+                value={form.group ?? ""}
+                onChange={(e) => {
+                  update("group", e.target.value);
+                  setGroupMenuOpen(true);
+                }}
+                onFocus={() => setGroupMenuOpen(true)}
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                tabIndex={-1}
+                className="absolute inset-y-0 right-0 flex items-center px-2.5 text-zinc-500 hover:text-zinc-300"
+                onClick={() => setGroupMenuOpen((v) => !v)}
+                title="选择已有分组"
+              >
+                <ChevronDown size={15} />
+              </button>
+              {groupMenuOpen && (
+                <div className="absolute left-0 right-0 top-[calc(100%+4px)] z-20 max-h-40 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-950 py-1 shadow-xl">
+                  {filteredGroups.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500">
+                      {existingGroups.length === 0
+                        ? "暂无已有分组，直接输入即可新建"
+                        : "无匹配分组，可继续输入新建"}
+                    </div>
+                  ) : (
+                    filteredGroups.map((name) => (
+                      <button
+                        key={name}
+                        type="button"
+                        className={`block w-full px-3 py-1.5 text-left text-sm hover:bg-zinc-800 ${
+                          form.group === name ? "bg-zinc-800 text-blue-300" : "text-zinc-200"
+                        }`}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          update("group", name);
+                          setGroupMenuOpen(false);
+                        }}
+                      >
+                        {name}
+                      </button>
+                    ))
+                  )}
+                  {(form.group ?? "").trim() && (
+                    <button
+                      type="button"
+                      className="block w-full border-t border-zinc-800 px-3 py-1.5 text-left text-xs text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        update("group", "");
+                        setGroupMenuOpen(false);
+                      }}
+                    >
+                      清除分组（未分组）
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
 
           <label className="block space-y-1">
             <span className="text-xs text-zinc-400">主机</span>

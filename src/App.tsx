@@ -5,7 +5,9 @@ import { DockLayout } from "./components/DockLayout";
 import { TerminalOutputBridge } from "./components/TerminalOutputBridge";
 import { ConnectionList } from "./components/ConnectionList";
 import { TransferDrawer } from "./components/TransferDrawer";
-import { TransferRail } from "./components/TransferRail";
+import { DockerDrawer } from "./components/DockerDrawer";
+import { RightRail } from "./components/RightRail";
+import type { RightPanelKind } from "./components/RightRail";
 import {
   CONSOLE_LAYOUT_STORAGE_KEY,
   captureWorkspaceBeforeClose,
@@ -43,6 +45,7 @@ function App() {
   const [debugClearFeedback, setDebugClearFeedback] = useState(false);
   const [mode, setMode] = useState<"ssh" | "console">("ssh");
   const [transferOpen, setTransferOpen] = useState(false);
+  const [dockerOpen, setDockerOpen] = useState(false);
   const setLocalConsoleReady = useLocalConsoleStore((s) => s.setReady);
 
   const saveCurrentDockLayout = () => {
@@ -63,8 +66,10 @@ function App() {
   useAppPersistence({
     mode,
     transferOpen,
+    dockerOpen,
     setMode,
     setTransferOpen,
+    setDockerOpen,
     setLocalConsoleReady,
     saveCurrentDockLayout,
     saveCurrentDockLayoutAsync,
@@ -73,6 +78,35 @@ function App() {
       await destroyAllLocalTerminals();
     },
   });
+
+  const rightPanelActive: RightPanelKind = transferOpen
+    ? "transfer"
+    : dockerOpen
+      ? "docker"
+      : null;
+
+  const openRightPanel = (panel: "transfer" | "docker") => {
+    if (panel === "transfer") {
+      if (transferOpen) {
+        setTransferOpen(false);
+        return;
+      }
+      setTransferOpen(true);
+      setDockerOpen(false);
+      return;
+    }
+    if (dockerOpen) {
+      setDockerOpen(false);
+      return;
+    }
+    setDockerOpen(true);
+    setTransferOpen(false);
+  };
+
+  const collapseRightPanel = () => {
+    setTransferOpen(false);
+    setDockerOpen(false);
+  };
 
   const handleResetLayout = () => {
     const api = getDockApi();
@@ -243,7 +277,12 @@ function App() {
           {mode === "ssh" && sshViewMode === "session" && (
             <>
               <TransferDrawer open={transferOpen} onClose={() => setTransferOpen(false)} />
-              <TransferRail open={transferOpen} onToggle={() => setTransferOpen((v) => !v)} />
+              <DockerDrawer open={dockerOpen} onClose={() => setDockerOpen(false)} />
+              <RightRail
+                active={rightPanelActive}
+                onSelect={openRightPanel}
+                onCollapse={collapseRightPanel}
+              />
             </>
           )}
         </div>

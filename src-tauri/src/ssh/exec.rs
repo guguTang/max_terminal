@@ -35,7 +35,7 @@ pub async fn run_remote_command_with_output(
         .await
         .map_err(|e| anyhow!("Failed to execute remote command: {e}"))?;
 
-    let mut exit_status = 1_i32;
+    let mut exit_status: Option<i32> = None;
     let mut output = String::new();
     loop {
         match channel.wait().await {
@@ -47,17 +47,18 @@ pub async fn run_remote_command_with_output(
             }
             Some(ChannelMsg::ExtendedData { .. }) => {}
             Some(ChannelMsg::ExitStatus { exit_status: status }) => {
-                exit_status = status as i32;
-                break;
+                // Do not break early: more Data/Eof may still arrive after ExitStatus.
+                exit_status = Some(status as i32);
             }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => break,
+            Some(ChannelMsg::Eof) => {}
+            Some(ChannelMsg::Close) | None => break,
             Some(_) => {}
-            None => break,
         }
     }
 
     Ok(RemoteCommandResult {
-        exit_code: exit_status,
+        // If the channel closed without ExitStatus (race), prefer 0 over a false failure.
+        exit_code: exit_status.unwrap_or(0),
         output,
     })
 }

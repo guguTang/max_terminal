@@ -8,6 +8,7 @@ use commands::app_state::{clear_app_state_cmd, clear_debug_data_cmd, exit_app, g
 use commands::connection::{
     delete_connection_cmd, list_connections_cmd, save_connection_cmd, test_connection_cmd,
 };
+use commands::docker::{docker_list_containers, docker_list_images};
 use commands::sftp::{
     connect_ssh, disconnect_ssh, sftp_list_dir, sftp_read_file, sftp_read_file_base64,
     sftp_remove_path, sftp_rename_path, sftp_write_file, sftp_write_file_base64,
@@ -62,6 +63,8 @@ pub fn run() {
             transfer_start_remote_copy,
             transfer_query,
             transfer_cancel,
+            docker_list_containers,
+            docker_list_images,
             terminal_create,
             terminal_apply_state,
             terminal_destroy,

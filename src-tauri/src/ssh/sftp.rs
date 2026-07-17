@@ -134,24 +134,44 @@ pub async fn write_file_bytes(session: &SharedSession, path: &str, content: &[u8
 }
 
 pub async fn remove_path(session: &SharedSession, path: &str, is_dir: bool) -> Result<()> {
+    if is_dir {
+        return remove_dir_recursive(session, path).await;
+    }
+    remove_file(session, path).await
+}
+
+async fn remove_file(session: &SharedSession, path: &str) -> Result<()> {
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
     };
     let inner = session.lock().await;
-    if is_dir {
-        inner
-            .sftp
-            .remove_dir(&sftp_path)
-            .await
-            .map_err(|e| anyhow!("Failed to remove directory: {e}"))
-    } else {
-        inner
-            .sftp
-            .remove_file(&sftp_path)
-            .await
-            .map_err(|e| anyhow!("Failed to remove file: {e}"))
+    inner
+        .sftp
+        .remove_file(&sftp_path)
+        .await
+        .map_err(|e| anyhow!("Failed to remove file: {e}"))
+}
+
+async fn remove_dir_recursive(session: &SharedSession, path: &str) -> Result<()> {
+    let entries = list_dir(session, path).await?;
+    for entry in entries {
+        if entry.is_dir {
+            Box::pin(remove_dir_recursive(session, &entry.path)).await?;
+        } else {
+            remove_file(session, &entry.path).await?;
+        }
     }
+    let sftp_path = {
+        let inner = session.lock().await;
+        ui_to_sftp(path, &inner.home_path)
+    };
+    let inner = session.lock().await;
+    inner
+        .sftp
+        .remove_dir(&sftp_path)
+        .await
+        .map_err(|e| anyhow!("Failed to remove directory: {e}"))
 }
 
 pub async fn rename_path(session: &SharedSession, path: &str, new_path: &str) -> Result<()> {

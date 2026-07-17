@@ -3,6 +3,7 @@ import {
   Box,
   Clock,
   Code2,
+  Container,
   FolderGit2,
   GitBranch,
   Layers,
@@ -70,7 +71,7 @@ export function TerminalContextBar({
   homePath,
   liveCwd,
 }: TerminalContextBarProps) {
-  const { cwd, condaEnv, virtualEnv, pyenvFromEnv, nodeVersion, remote, git } =
+  const { cwd, condaEnv, virtualEnv, pyenvFromEnv, nodeVersion, docker, remote, git } =
     useTerminalContext(sessionId, terminalId, true, liveCwd, kind);
 
   const copyCwd = async () => {
@@ -89,6 +90,7 @@ export function TerminalContextBar({
     Boolean(git) ||
     Boolean(remote.svn) ||
     Boolean(remote.k8s) ||
+    Boolean(docker) ||
     Boolean(condaEnv) ||
     Boolean(virtualEnv) ||
     Boolean(pyenvVersion) ||
@@ -181,6 +183,19 @@ export function TerminalContextBar({
           label={`k8s: ${remote.k8s.context}`}
           title={`Kubernetes context ${remote.k8s.context}`}
           className="text-violet-400/90"
+        />
+      ) : null}
+
+      {docker ? (
+        <Chip
+          icon={<Container size={12} />}
+          label={`docker: ${docker.name}`}
+          title={
+            docker.id
+              ? `容器内 ${docker.name} (${docker.id})`
+              : `容器内 ${docker.name}`
+          }
+          className="text-cyan-400/90"
         />
       ) : null}
 

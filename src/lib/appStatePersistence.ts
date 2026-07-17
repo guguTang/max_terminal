@@ -13,6 +13,7 @@ export interface PersistedAppStateV1 {
   activeConnectionId: string | null;
   openConnectionIds: string[];
   transferOpen: boolean;
+  dockerOpen?: boolean;
   terminalOutputs: Record<string, string>;
 }
 
@@ -43,6 +44,7 @@ function trimTerminalOutputs(outputs: Record<string, string>): Record<string, st
 export function captureAppState(input: {
   mode: AppMode;
   transferOpen: boolean;
+  dockerOpen: boolean;
 }): PersistedAppStateV1 {
   const session = useSessionStore.getState();
   return {
@@ -52,6 +54,7 @@ export function captureAppState(input: {
     activeConnectionId: session.connectionId,
     openConnectionIds: session.sessions.map((item) => item.connectionId),
     transferOpen: input.transferOpen,
+    dockerOpen: input.dockerOpen,
     terminalOutputs: trimTerminalOutputs(useTerminalOutputStore.getState().exportBuffers()),
   };
 }
@@ -71,6 +74,7 @@ export async function loadPersistedAppState(): Promise<PersistedAppStateV1 | nul
 export async function persistAppState(input: {
   mode: AppMode;
   transferOpen: boolean;
+  dockerOpen: boolean;
 }): Promise<void> {
   if (restoring) return;
   try {
@@ -84,6 +88,7 @@ export async function persistAppState(input: {
 export function schedulePersistAppState(input: {
   mode: AppMode;
   transferOpen: boolean;
+  dockerOpen: boolean;
 }) {
   if (restoring) return;
   if (persistTimer) clearTimeout(persistTimer);
@@ -104,6 +109,7 @@ export async function clearPersistedAppState(): Promise<void> {
 export async function restoreAppState(options: {
   setMode: (mode: AppMode) => void;
   setTransferOpen: (open: boolean) => void;
+  setDockerOpen: (open: boolean) => void;
   setLocalConsoleReady: (ready: boolean) => void;
 }): Promise<void> {
   restoring = true;
@@ -117,7 +123,10 @@ export async function restoreAppState(options: {
     }
 
     options.setMode(saved.mode);
-    options.setTransferOpen(saved.transferOpen);
+    const transferOpen = Boolean(saved.transferOpen);
+    const dockerOpen = Boolean(saved.dockerOpen) && !transferOpen;
+    options.setTransferOpen(transferOpen);
+    options.setDockerOpen(dockerOpen);
     if (saved.mode === "console") {
       options.setLocalConsoleReady(true);
     }
@@ -163,6 +172,7 @@ export function installAppClosePersistence(
   getInput: () => {
     mode: AppMode;
     transferOpen: boolean;
+    dockerOpen: boolean;
     saveCurrentDockLayout: () => void;
     saveCurrentDockLayoutAsync?: () => Promise<void>;
   },
@@ -182,6 +192,7 @@ export function installAppClosePersistence(
       await persistAppState({
         mode: input.mode,
         transferOpen: input.transferOpen,
+        dockerOpen: input.dockerOpen,
       });
       await onClose?.();
     } catch (error) {

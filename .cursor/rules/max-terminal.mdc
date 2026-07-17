@@ -15,14 +15,14 @@ alwaysApply: true
 
 ## 工作区快照（切换后保持状态）
 
-- 快照在 `workspaceStore`：`dockJson`、`fileTreePath`、`selectedFile`、`terminalRuntimeById`。
+- 快照在 `workspaceStore`：`dockJson`、`fileTreePath`、`selectedFile`、`terminalRuntimeById`、`fileTreeExpandedPaths`。
 - 切换前：`captureTerminalRuntimeForConnection` + `captureConnectionWorkspace`（或切换队列内 `captureConnectionWorkspaceForced`）。
 - `restoreConnectionWorkspace` 须先 `api.clear()` 再 `fromJSON`；恢复后 `pruneEmptyDockGroups` 并回写清理后的快照。
 - 空 group（无面板）会显示为顶部空白区域；捕获快照前须 prune，健康检查须 `groups` 无空项。
 - 已连接时 **不要** 在 `onReady` 里先 `createDefaultLayout` 再 restore。
 - 切换后：`restoreConnectionWorkspace` → `api.fromJSON` + `stampTerminalConnectionId`。
 - 文件树路径：用 effect cleanup 按 `connectionId` 写回，避免切换时把 A 的路径误写到 B。
-- `RemoteFileTree` 的 `key={connectionId}` 会 remount；目录状态靠 `fileTreePath` 快照恢复，展开状态不持久化。
+- 文件树展开状态按连接持久化在 `fileTreeExpandedPaths`；滚动位置在 `fileTreeScrollTop`；切换 SSH 后从快照恢复。
 
 ## 终端 PTY 生命周期（重要）
 

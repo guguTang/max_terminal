@@ -20,6 +20,7 @@ pub async fn terminal_query_context(
             "k8s".to_string(),
             "pyenv".to_string(),
             "node".to_string(),
+            "docker".to_string(),
         ]
     });
 

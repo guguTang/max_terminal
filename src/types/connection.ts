@@ -9,6 +9,8 @@ export interface Connection {
   authType: AuthType;
   password?: string;
   privateKey?: string;
+  /** 可选分组名；空/缺省表示未分组 */
+  group?: string;
   createdAt: number;
 }
 
@@ -48,7 +50,7 @@ export interface TerminalCreateOptions {
   rows?: number;
 }
 
-export type TerminalContextProvider = "git" | "svn" | "k8s" | "pyenv" | "node";
+export type TerminalContextProvider = "git" | "svn" | "k8s" | "pyenv" | "node" | "docker";
 
 export interface GitContext {
   branch: string;
@@ -72,12 +74,18 @@ export interface NodeContext {
   version: string;
 }
 
+export interface DockerContext {
+  name: string;
+  id?: string;
+}
+
 export interface TerminalContextResult {
   git?: GitContext;
   svn?: SvnContext;
   k8s?: K8sContext;
   pyenv?: PyenvContext;
   node?: NodeContext;
+  docker?: DockerContext;
 }
 
 export const TEXT_EXTENSIONS = new Set([

@@ -40,6 +40,13 @@ pub struct NodeContext {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContext {
+    pub name: String,
+    pub id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalContextResult {
@@ -48,6 +55,7 @@ pub struct TerminalContextResult {
     pub k8s: Option<K8sContext>,
     pub pyenv: Option<PyenvContext>,
     pub node: Option<NodeContext>,
+    pub docker: Option<DockerContext>,
 }
 
 pub async fn query_terminal_context(
@@ -103,6 +111,11 @@ pub async fn query_terminal_context(
             "node" => {
                 if let Some(ctx) = query_node(session, &cwd, env, is_local).await? {
                     result.node = Some(ctx);
+                }
+            }
+            "docker" => {
+                if let Some(ctx) = query_docker(session, &cwd, is_local).await? {
+                    result.docker = Some(ctx);
                 }
             }
             _ => {}
@@ -400,6 +413,40 @@ async fn query_k8s(
         return Ok(None);
     }
     Ok(Some(K8sContext { context }))
+}
+
+async fn query_docker(
+    session: Option<&SharedSession>,
+    cwd: &str,
+    is_local: bool,
+) -> Result<Option<DockerContext>> {
+    let script = r#"
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+  name=$(hostname 2>/dev/null || echo container)
+  printf '%s\n' "$name"
+  exit 0
+fi
+if [ -r /proc/1/cgroup ] && grep -Eqi 'docker|containerd|kubepods|libpod' /proc/1/cgroup 2>/dev/null; then
+  name=$(hostname 2>/dev/null || echo container)
+  printf '%s\n' "$name"
+  exit 0
+fi
+exit 1
+"#;
+    let ShellOutput { stdout, exit_code } = run_in_cwd(session, cwd, script, is_local)
+        .await
+        .unwrap_or(ShellOutput {
+            stdout: String::new(),
+            exit_code: 1,
+        });
+    let name = stdout.trim().to_string();
+    if exit_code != 0 || name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DockerContext {
+        name,
+        id: None,
+    }))
 }
 
 async fn query_pyenv(

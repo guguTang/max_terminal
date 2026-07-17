@@ -19,6 +19,9 @@ interface TreeNodeProps {
   onSelect: (path: string) => void;
   selectedPath: string | null;
   reloadKey: number;
+  pathReloadKeys: Record<string, number>;
+  expandedPaths: Set<string>;
+  onExpandedChange: (path: string, expanded: boolean) => void;
   onContextMenu: (entry: FileEntry, event: React.MouseEvent<HTMLDivElement>) => void;
   mutation: TreeMutation | null;
 }
@@ -95,14 +98,18 @@ function TreeNode({
   onSelect,
   selectedPath,
   reloadKey,
+  pathReloadKeys,
+  expandedPaths,
+  onExpandedChange,
   onContextMenu,
   mutation,
 }: TreeNodeProps) {
-  const [expanded, setExpanded] = useState(false);
+  const expanded = entry.isDir && expandedPaths.has(entry.path);
   const [children, setChildren] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const pathReloadKey = pathReloadKeys[entry.path] ?? 0;
 
   const loadChildren = useCallback(async () => {
     if (!sessionId || !entry.isDir) return;
@@ -126,7 +133,7 @@ function TreeNode({
   useEffect(() => {
     if (!expanded || !entry.isDir) return;
     void loadChildren();
-  }, [reloadKey, expanded, entry.isDir, loadChildren]);
+  }, [reloadKey, pathReloadKey, expanded, entry.isDir, loadChildren]);
 
   useEffect(() => {
     if (!mutation) return;
@@ -168,7 +175,7 @@ function TreeNode({
       );
       return filtered.length === prev.length ? prev : filtered;
     });
-  }, [mutation]);
+  }, [mutation, entry.path]);
 
   const toggle = async () => {
     if (!entry.isDir) {
@@ -179,9 +186,9 @@ function TreeNode({
       if (!loaded) {
         await loadChildren();
       }
-      setExpanded(true);
+      onExpandedChange(entry.path, true);
     } else {
-      setExpanded(false);
+      onExpandedChange(entry.path, false);
     }
   };
 
@@ -245,6 +252,9 @@ function TreeNode({
             onSelect={onSelect}
             selectedPath={selectedPath}
             reloadKey={reloadKey}
+            pathReloadKeys={pathReloadKeys}
+            expandedPaths={expandedPaths}
+            onExpandedChange={onExpandedChange}
             mutation={mutation}
             onContextMenu={onContextMenu}
           />
@@ -275,6 +285,10 @@ export function RemoteFileTree({
   const sessionId = boundSessionId ?? sessionForConnection?.sessionId ?? activeSessionId;
   const homePath = boundHomePath ?? sessionForConnection?.homePath ?? activeHomePath;
   const browseGenerationRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pendingScrollTopRef = useRef<number | null>(null);
+  const restoringScrollRef = useRef(false);
+  const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connections = useConnectionStore((s) => s.connections);
   const fetchConnections = useConnectionStore((s) => s.fetchConnections);
   const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -284,6 +298,8 @@ export function RemoteFileTree({
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [pathReloadKeys, setPathReloadKeys] = useState<Record<string, number>>({});
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [mutation, setMutation] = useState<TreeMutation | null>(null);
   const mutationSeqRef = useRef(0);
   const [menu, setMenu] = useState<{
@@ -302,6 +318,10 @@ export function RemoteFileTree({
   const [remoteCopyDestDir, setRemoteCopyDestDir] = useState("");
   const [remoteCopyDestConnecting, setRemoteCopyDestConnecting] = useState(false);
   const [remoteCopyCompress, setRemoteCopyCompress] = useState(false);
+  const [remoteCopyConflict, setRemoteCopyConflict] = useState<{
+    destPath: string;
+    isDir: boolean;
+  } | null>(null);
   const [folderTransferPrompt, setFolderTransferPrompt] = useState<FolderTransferPrompt | null>(
     null,
   );
@@ -323,12 +343,20 @@ export function RemoteFileTree({
     setEntries([]);
     setError(null);
     setLoading(false);
+    setPathReloadKeys({});
     if (!connectionId || !homePath) {
       setCurrentPath(null);
+      setExpandedPaths(new Set());
+      pendingScrollTopRef.current = null;
       return;
     }
     const saved = useWorkspaceStore.getState().getFileTreePath(connectionId);
     setCurrentPath(saved ?? homePath);
+    const savedExpanded =
+      useWorkspaceStore.getState().getFileTreeExpandedPaths(connectionId);
+    setExpandedPaths(new Set(savedExpanded));
+    pendingScrollTopRef.current =
+      useWorkspaceStore.getState().getFileTreeScrollTop(connectionId);
   }, [connectionId, homePath, sessionId]);
 
   useEffect(() => {
@@ -338,8 +366,139 @@ export function RemoteFileTree({
     useWorkspaceStore.getState().setFileTreePath(savedFor, savedPath);
     return () => {
       useWorkspaceStore.getState().setFileTreePath(savedFor, savedPath);
+      const el = scrollRef.current;
+      if (el) {
+        useWorkspaceStore.getState().setFileTreeScrollTop(savedFor, el.scrollTop);
+      }
     };
   }, [connectionId, currentPath]);
+
+  const saveScrollTop = useCallback(
+    (scrollTop: number) => {
+      if (!connectionId || restoringScrollRef.current) return;
+      if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+      scrollSaveTimerRef.current = setTimeout(() => {
+        scrollSaveTimerRef.current = null;
+        useWorkspaceStore.getState().setFileTreeScrollTop(connectionId, scrollTop);
+      }, 120);
+    },
+    [connectionId],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+    };
+  }, []);
+
+  /** 根目录与展开子树加载完成后，把滚动位置拉回切换前 */
+  useEffect(() => {
+    if (loading || pendingScrollTopRef.current == null) return;
+    const el = scrollRef.current;
+    if (!el) return;
+
+    const target = pendingScrollTopRef.current;
+    let cancelled = false;
+    let lastHeight = -1;
+    let stableFrames = 0;
+
+    const apply = () => {
+      if (cancelled || pendingScrollTopRef.current == null) return;
+      restoringScrollRef.current = true;
+      el.scrollTop = target;
+      requestAnimationFrame(() => {
+        restoringScrollRef.current = false;
+      });
+    };
+
+    apply();
+
+    const tick = () => {
+      if (cancelled || pendingScrollTopRef.current == null) return;
+      const height = el.scrollHeight;
+      apply();
+      if (height === lastHeight) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+        lastHeight = height;
+      }
+      // 高度连续稳定几帧，认为展开子树已加载完
+      if (stableFrames >= 4) {
+        pendingScrollTopRef.current = null;
+        useWorkspaceStore.getState().setFileTreeScrollTop(
+          connectionId!,
+          el.scrollTop,
+        );
+        return;
+      }
+      requestAnimationFrame(tick);
+    };
+    const raf = requestAnimationFrame(tick);
+
+    const maxWait = window.setTimeout(() => {
+      if (pendingScrollTopRef.current == null) return;
+      apply();
+      pendingScrollTopRef.current = null;
+      if (connectionId) {
+        useWorkspaceStore.getState().setFileTreeScrollTop(connectionId, el.scrollTop);
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      window.clearTimeout(maxWait);
+    };
+  }, [loading, connectionId, entries, expandedPaths]);
+
+  const handleExpandedChange = useCallback(
+    (path: string, expanded: boolean) => {
+      setExpandedPaths((prev) => {
+        const next = new Set(prev);
+        if (expanded) {
+          next.add(path);
+        } else {
+          next.delete(path);
+          for (const item of [...next]) {
+            if (item.startsWith(`${path}/`)) next.delete(item);
+          }
+        }
+        return next;
+      });
+      if (connectionId) {
+        useWorkspaceStore.getState().setFileTreeExpanded(connectionId, path, expanded);
+      }
+    },
+    [connectionId],
+  );
+
+  const refreshTree = useCallback(() => {
+    setReloadKey((k) => k + 1);
+  }, []);
+
+  const refreshFolder = useCallback(
+    (path: string) => {
+      if (path === currentPath) {
+        setReloadKey((k) => k + 1);
+        return;
+      }
+      setExpandedPaths((prev) => {
+        if (prev.has(path)) return prev;
+        const next = new Set(prev);
+        next.add(path);
+        return next;
+      });
+      if (connectionId) {
+        useWorkspaceStore.getState().setFileTreeExpanded(connectionId, path, true);
+      }
+      setPathReloadKeys((prev) => ({
+        ...prev,
+        [path]: (prev[path] ?? 0) + 1,
+      }));
+    },
+    [connectionId, currentPath],
+  );
 
   useEffect(() => {
     if (!sessionId || !currentPath) {
@@ -384,10 +543,6 @@ export function RemoteFileTree({
       window.removeEventListener("resize", close);
       window.removeEventListener("scroll", close, true);
     };
-  }, []);
-
-  const refreshTree = useCallback(() => {
-    setReloadKey((k) => k + 1);
   }, []);
 
   const pollTransfer = useCallback(async (taskId: string): Promise<TransferTaskSnapshot> => {
@@ -677,13 +832,46 @@ export function RemoteFileTree({
         newPath: nextPath,
         newName: nextName,
       });
+      if (connectionId && renameTarget.isDir) {
+        setExpandedPaths((prev) => {
+          const next = new Set<string>();
+          for (const p of prev) {
+            if (p === renameTarget.path) {
+              next.add(nextPath);
+            } else if (p.startsWith(`${renameTarget.path}/`)) {
+              next.add(`${nextPath}${p.slice(renameTarget.path.length)}`);
+            } else {
+              next.add(p);
+            }
+          }
+          return next;
+        });
+        const store = useWorkspaceStore.getState();
+        const prevPaths = store.getFileTreeExpandedPaths(connectionId);
+        for (const p of prevPaths) {
+          if (p === renameTarget.path || p.startsWith(`${renameTarget.path}/`)) {
+            store.setFileTreeExpanded(connectionId, p, false);
+          }
+        }
+        for (const p of prevPaths) {
+          if (p === renameTarget.path) {
+            store.setFileTreeExpanded(connectionId, nextPath, true);
+          } else if (p.startsWith(`${renameTarget.path}/`)) {
+            store.setFileTreeExpanded(
+              connectionId,
+              `${nextPath}${p.slice(renameTarget.path.length)}`,
+              true,
+            );
+          }
+        }
+      }
       setRenameTarget(null);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
     }
-  }, [currentPath, renameTarget, renameValue, selectedFile, sessionId]);
+  }, [connectionId, currentPath, renameTarget, renameValue, selectedFile, sessionId]);
 
   const openDeleteDialog = useCallback((entry: FileEntry) => {
     setDeleteTarget(entry);
@@ -753,6 +941,7 @@ export function RemoteFileTree({
         setError("请先在连接列表中添加另一台服务器");
         return;
       }
+      setRemoteCopyConflict(null);
       setRemoteCopyTarget(entry);
       setRemoteCopyDestConnectionId(first.id);
       setRemoteCopyDestDir("");
@@ -782,6 +971,65 @@ export function RemoteFileTree({
     );
   }, [executeDownload, executeUpload, folderTransferCompress, folderTransferPrompt]);
 
+  const startRemoteCopyTransfer = useCallback(
+    async (destPath: string, destSessionId: string) => {
+      if (!sessionId || !connectionId || !remoteCopyTarget) return;
+      setBusy(true);
+      setError(null);
+      setNotice(null);
+      try {
+        const task = await invoke<TransferTaskSnapshot>("transfer_start_remote_copy", {
+          sourceSessionId: sessionId,
+          destConnectionId: remoteCopyDestConnectionId,
+          sourcePath: remoteCopyTarget.path,
+          destPath,
+          compress: remoteCopyTarget.isDir ? remoteCopyCompress : false,
+        });
+        startTransfer({
+          id: task.taskId,
+          direction: "remote-copy",
+          connectionId,
+          sessionId,
+          remotePath: remoteCopyTarget.path,
+          destConnectionId: remoteCopyDestConnectionId,
+          destSessionId: task.destSessionId ?? destSessionId,
+          destRemotePath: destPath,
+          fileName: remoteCopyTarget.name,
+          totalBytes: task.totalBytes ?? undefined,
+        });
+        setRemoteCopyConflict(null);
+        setRemoteCopyTarget(null);
+        const snapshot = await pollTransfer(task.taskId);
+        if (snapshot.status === "success") {
+          finishSuccess(task.taskId);
+          setNotice(`已复制到远程: ${destPath}`);
+        } else if (snapshot.status === "cancelled") {
+          finishCancelled(task.taskId);
+          setNotice("远程复制已取消");
+        } else {
+          finishFailed(task.taskId, snapshot.error ?? "远程复制失败");
+          setError(snapshot.error ?? "远程复制失败");
+        }
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      connectionId,
+      finishCancelled,
+      finishFailed,
+      finishSuccess,
+      pollTransfer,
+      remoteCopyCompress,
+      remoteCopyDestConnectionId,
+      remoteCopyTarget,
+      sessionId,
+      startTransfer,
+    ],
+  );
+
   const handleRemoteCopySubmit = useCallback(async () => {
     if (!sessionId || !connectionId || !remoteCopyTarget) return;
     const destDir = remoteCopyDestDir.trim();
@@ -803,37 +1051,25 @@ export function RemoteFileTree({
       if (!destSession) {
         destSession = await connectBackground(remoteCopyDestConnectionId);
       }
-      const task = await invoke<TransferTaskSnapshot>("transfer_start_remote_copy", {
-        sourceSessionId: sessionId,
-        destConnectionId: remoteCopyDestConnectionId,
-        sourcePath: remoteCopyTarget.path,
-        destPath,
-        compress: remoteCopyTarget.isDir ? remoteCopyCompress : false,
-      });
-      startTransfer({
-        id: task.taskId,
-        direction: "remote-copy",
-        connectionId,
-        sessionId,
-        remotePath: remoteCopyTarget.path,
-        destConnectionId: remoteCopyDestConnectionId,
-        destSessionId: task.destSessionId ?? destSession.sessionId,
-        destRemotePath: destPath,
-        fileName: remoteCopyTarget.name,
-        totalBytes: task.totalBytes ?? undefined,
-      });
-      setRemoteCopyTarget(null);
-      const snapshot = await pollTransfer(task.taskId);
-      if (snapshot.status === "success") {
-        finishSuccess(task.taskId);
-        setNotice(`已复制到远程: ${destPath}`);
-      } else if (snapshot.status === "cancelled") {
-        finishCancelled(task.taskId);
-        setNotice("远程复制已取消");
-      } else {
-        finishFailed(task.taskId, snapshot.error ?? "远程复制失败");
-        setError(snapshot.error ?? "远程复制失败");
+
+      let existing: FileEntry | undefined;
+      try {
+        const destEntries = await invoke<FileEntry[]>("sftp_list_dir", {
+          sessionId: destSession.sessionId,
+          path: destDir,
+        });
+        existing = destEntries.find((item) => item.name === remoteCopyTarget.name);
+      } catch (e) {
+        setError(`无法读取目标目录: ${e}`);
+        return;
       }
+
+      if (existing) {
+        setRemoteCopyConflict({ destPath, isDir: existing.isDir });
+        return;
+      }
+
+      await startRemoteCopyTransfer(destPath, destSession.sessionId);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -842,18 +1078,50 @@ export function RemoteFileTree({
   }, [
     connectionId,
     connectBackground,
-    finishCancelled,
-    finishFailed,
-    finishSuccess,
-    pollTransfer,
     remoteCopyDestConnectionId,
     remoteCopyDestDir,
-    remoteCopyCompress,
     remoteCopyTarget,
     sessions,
     sessionId,
-    startTransfer,
+    startRemoteCopyTransfer,
   ]);
+
+  const handleRemoteCopyOverwrite = useCallback(async () => {
+    if (!remoteCopyConflict || !remoteCopyTarget) return;
+    const destSession = sessions.find(
+      (item) => item.connectionId === remoteCopyDestConnectionId,
+    );
+    if (!destSession) {
+      setError("目标连接未就绪");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("sftp_remove_path", {
+        sessionId: destSession.sessionId,
+        path: remoteCopyConflict.destPath,
+        isDir: remoteCopyConflict.isDir,
+      });
+      await startRemoteCopyTransfer(remoteCopyConflict.destPath, destSession.sessionId);
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }, [
+    remoteCopyConflict,
+    remoteCopyDestConnectionId,
+    remoteCopyTarget,
+    sessions,
+    startRemoteCopyTransfer,
+  ]);
+
+  const handleRemoteCopySkip = useCallback(() => {
+    if (!remoteCopyConflict) return;
+    setNotice(`已跳过：目标已存在 ${remoteCopyConflict.destPath}`);
+    setRemoteCopyConflict(null);
+    setRemoteCopyTarget(null);
+  }, [remoteCopyConflict]);
 
   const handleDeleteConfirm = useCallback(async () => {
     if (!sessionId) return;
@@ -881,13 +1149,26 @@ export function RemoteFileTree({
         type: "delete",
         targetPath: deleteTarget.path,
       });
+      if (connectionId && deleteTarget.isDir) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev);
+          next.delete(deleteTarget.path);
+          for (const p of [...next]) {
+            if (p.startsWith(`${deleteTarget.path}/`)) next.delete(p);
+          }
+          return next;
+        });
+        useWorkspaceStore
+          .getState()
+          .setFileTreeExpanded(connectionId, deleteTarget.path, false);
+      }
       setDeleteTarget(null);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
     }
-  }, [currentPath, deleteTarget, selectedFile, sessionId]);
+  }, [connectionId, currentPath, deleteTarget, selectedFile, sessionId]);
 
   const menuItems = useMemo(() => {
     if (!menu) return [];
@@ -898,6 +1179,10 @@ export function RemoteFileTree({
       action: () => openRemoteCopyDialog(menu.entry),
     };
     const dirItems = [
+      {
+        label: "刷新此目录",
+        action: () => refreshFolder(menu.entry.path),
+      },
       {
         label: "上传文件到此目录",
         action: () => void startUpload(targetDir, false),
@@ -960,6 +1245,7 @@ export function RemoteFileTree({
     openRemoteCopyDialog,
     openRenameDialog,
     destConnections.length,
+    refreshFolder,
     startUpload,
   ]);
 
@@ -1032,7 +1318,16 @@ export function RemoteFileTree({
           </div>
         )}
       </div>
-      <div className="remote-file-tree-scroll flex-1 overflow-auto py-1">
+      <div
+        ref={scrollRef}
+        className="remote-file-tree-scroll flex-1 overflow-auto py-1"
+        onScroll={(event) => {
+          if (restoringScrollRef.current) return;
+          // 用户手动滚动：停止强制恢复，并记住新位置
+          pendingScrollTopRef.current = null;
+          saveScrollTop(event.currentTarget.scrollTop);
+        }}
+      >
         {loading && (
           <div className="flex items-center justify-center gap-2 py-6 text-sm text-zinc-500">
             <Loader2 size={16} className="animate-spin" />
@@ -1057,10 +1352,13 @@ export function RemoteFileTree({
               onSelect={onFileSelect}
               selectedPath={selectedFile}
               reloadKey={reloadKey}
+              pathReloadKeys={pathReloadKeys}
+              expandedPaths={expandedPaths}
+              onExpandedChange={handleExpandedChange}
               mutation={mutation}
               onContextMenu={(target, event) => {
                 const itemHeight = 34;
-                const itemCount = target.isDir ? 7 : 7;
+                const itemCount = target.isDir ? 8 : 7;
                 const menuHeight = itemHeight * itemCount + 8;
                 const menuWidth = 220;
                 let x = event.clientX;
@@ -1282,7 +1580,10 @@ export function RemoteFileTree({
       {remoteCopyTarget && (
         <div
           className="fixed inset-0 z-[250] flex items-center justify-center bg-black/40"
-          onClick={() => setRemoteCopyTarget(null)}
+          onClick={() => {
+            if (remoteCopyConflict || busy) return;
+            setRemoteCopyTarget(null);
+          }}
         >
           <div
             className="w-[560px] rounded-lg border border-zinc-700 bg-zinc-900 p-4"
@@ -1300,11 +1601,13 @@ export function RemoteFileTree({
                 <select
                   value={remoteCopyDestConnectionId}
                   onChange={(e) => {
+                    setRemoteCopyConflict(null);
                     setRemoteCopyDestConnectionId(e.target.value);
                     setRemoteCopyDestDir("");
                     setRemoteCopyDestSessionId("");
                   }}
-                  className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-blue-500"
+                  disabled={busy || Boolean(remoteCopyConflict)}
+                  className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-blue-500 disabled:opacity-50"
                 >
                   {destConnections.map((item) => (
                     <option key={item.id} value={item.id}>
@@ -1324,8 +1627,16 @@ export function RemoteFileTree({
                 sessionId={remoteCopyDestSessionId}
                 homePath={remoteCopyDestHomePath}
                 value={remoteCopyDestDir}
-                onChange={setRemoteCopyDestDir}
-                disabled={busy || remoteCopyDestConnecting || !remoteCopyDestSessionId}
+                onChange={(path) => {
+                  setRemoteCopyConflict(null);
+                  setRemoteCopyDestDir(path);
+                }}
+                disabled={
+                  busy ||
+                  remoteCopyDestConnecting ||
+                  !remoteCopyDestSessionId ||
+                  Boolean(remoteCopyConflict)
+                }
               />
               <div className="text-[11px] text-zinc-500 break-all">
                 将复制为: {joinRemotePath(remoteCopyDestDir.trim() || "/", remoteCopyTarget.name)}
@@ -1336,6 +1647,7 @@ export function RemoteFileTree({
                     type="checkbox"
                     checked={remoteCopyCompress}
                     onChange={(e) => setRemoteCopyCompress(e.target.checked)}
+                    disabled={busy || Boolean(remoteCopyConflict)}
                     className="rounded border-zinc-600"
                   />
                   压缩后传输 (tar.gz)
@@ -1346,17 +1658,73 @@ export function RemoteFileTree({
               <button
                 type="button"
                 className="rounded-md px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800"
-                onClick={() => setRemoteCopyTarget(null)}
+                disabled={busy}
+                onClick={() => {
+                  setRemoteCopyConflict(null);
+                  setRemoteCopyTarget(null);
+                }}
               >
                 取消
               </button>
               <button
                 type="button"
                 className="rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-500 disabled:opacity-40"
-                disabled={busy || remoteCopyDestConnecting || !remoteCopyDestSessionId}
+                disabled={
+                  busy ||
+                  remoteCopyDestConnecting ||
+                  !remoteCopyDestSessionId ||
+                  Boolean(remoteCopyConflict)
+                }
                 onClick={() => void handleRemoteCopySubmit()}
               >
                 开始传输
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {remoteCopyConflict && (
+        <div
+          className="fixed inset-0 z-[260] flex items-center justify-center bg-black/50"
+          onClick={() => {
+            if (!busy) setRemoteCopyConflict(null);
+          }}
+        >
+          <div
+            className="w-[420px] rounded-lg border border-zinc-700 bg-zinc-900 p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 text-sm font-medium text-zinc-100">目标已存在</div>
+            <div className="mb-1 text-sm text-zinc-300">
+              目标路径已有同名{remoteCopyConflict.isDir ? "目录" : "文件"}：
+            </div>
+            <div className="mb-4 text-xs text-zinc-400 break-all font-mono">
+              {remoteCopyConflict.destPath}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-md px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+                disabled={busy}
+                onClick={() => setRemoteCopyConflict(null)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-zinc-600 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
+                disabled={busy}
+                onClick={handleRemoteCopySkip}
+              >
+                跳过
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-sm text-white hover:bg-amber-500 disabled:opacity-40"
+                disabled={busy}
+                onClick={() => void handleRemoteCopyOverwrite()}
+              >
+                {busy ? "处理中…" : "覆盖"}
               </button>
             </div>
           </div>
