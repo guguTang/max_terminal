@@ -5,14 +5,14 @@ use serde_json::Deserializer;
 use tauri::State;
 
 /// Non-interactive SSH exec often has a minimal PATH (docker may live in
-/// `/usr/local/bin`, Homebrew, or Docker Desktop paths). Run via login shell
-/// and prepend common locations.
+/// `/usr/local/bin`, Homebrew, or Docker Desktop paths).
+/// Use `--noprofile --norc` so login MOTD / .bashrc banners do not pollute JSON.
 fn docker_remote_command(docker_args: &str) -> String {
     let inner = format!(
         "PATH=\"/usr/local/bin:/opt/homebrew/bin:/usr/bin:$HOME/bin:$HOME/.docker/bin:$PATH\" \
          docker {docker_args}"
     );
-    format!("bash -lc {}", shell_quote(&inner))
+    format!("bash --noprofile --norc -c {}", shell_quote(&inner))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -94,22 +94,53 @@ fn first_nonempty_line(s: &str) -> &str {
         .unwrap_or(s.trim())
 }
 
+/// Drop login banners / warnings before the first JSON object.
+fn json_payload(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed;
+    }
+    if let Some(idx) = trimmed.find('{') {
+        return &trimmed[idx..];
+    }
+    trimmed
+}
+
+fn snippet_for_error(raw: &str) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 160 {
+        compact
+    } else {
+        let truncated: String = compact.chars().take(160).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Parse one or more JSON values from docker `--format '{{json .}}'` output.
 /// Docker may emit NDJSON (one object per line) or pack several objects on one line.
 fn parse_json_stream<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<Vec<T>, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let payload = json_payload(raw);
+    if payload.is_empty() {
         return Ok(Vec::new());
+    }
+    if !payload.starts_with('{') {
+        return Err(format!(
+            "解析 docker 输出失败: 不是 JSON（开头: {}）",
+            snippet_for_error(payload)
+        ));
     }
 
     let mut out = Vec::new();
-    let mut de = Deserializer::from_str(trimmed).into_iter::<T>();
+    let mut de = Deserializer::from_str(payload).into_iter::<T>();
     while let Some(item) = de.next() {
         match item {
             Ok(v) => out.push(v),
             Err(e) => {
                 if out.is_empty() {
-                    return Err(format!("解析 docker 输出失败: {e}"));
+                    return Err(format!(
+                        "解析 docker 输出失败: {e}（开头: {}）",
+                        snippet_for_error(payload)
+                    ));
                 }
                 // Trailing noise after valid JSON (e.g. stderr warnings) — keep what we got.
                 break;
@@ -119,20 +150,48 @@ fn parse_json_stream<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<Vec<T>, 
     Ok(out)
 }
 
-fn docker_failure_message(exit_code: i32, output: &str) -> String {
-    let detail = first_nonempty_line(output);
+fn docker_failure_message(exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let detail = first_nonempty_line(stderr);
+    let detail = if detail.is_empty() {
+        first_nonempty_line(stdout)
+    } else {
+        detail
+    };
     if exit_code == 127
         || detail.contains("command not found")
         || detail.contains("not found")
     {
         return "未找到 docker 命令。请确认当前 SSH 主机已安装 Docker，\
-                且登录 shell 的 PATH 中可执行 `docker`。"
+                且 PATH 中可执行 `docker`。"
             .to_string();
     }
     if detail.is_empty() {
         format!("docker 命令失败 (exit {exit_code})")
     } else {
         format!("docker 命令失败 (exit {exit_code}): {detail}")
+    }
+}
+
+fn map_docker_list_result<T, R, F>(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    map_row: F,
+) -> Result<Vec<R>, String>
+where
+    T: for<'de> Deserialize<'de>,
+    F: Fn(T) -> R,
+{
+    match parse_json_stream::<T>(stdout) {
+        Ok(rows) if !rows.is_empty() || exit_code == 0 => Ok(rows.into_iter().map(map_row).collect()),
+        Ok(_) => Err(docker_failure_message(exit_code, stdout, stderr)),
+        Err(parse_err) => {
+            if exit_code != 0 {
+                Err(docker_failure_message(exit_code, stdout, stderr))
+            } else {
+                Err(parse_err)
+            }
+        }
     }
 }
 
@@ -155,20 +214,11 @@ pub async fn docker_list_containers(
     .await
     .map_err(|e| e.to_string())?;
 
-    let rows = match parse_json_stream::<DockerPsRow>(&result.output) {
-        Ok(rows) if !rows.is_empty() || result.exit_code == 0 => rows,
-        Ok(_) => return Err(docker_failure_message(result.exit_code, &result.output)),
-        Err(parse_err) => {
-            if result.exit_code != 0 {
-                return Err(docker_failure_message(result.exit_code, &result.output));
-            }
-            return Err(parse_err);
-        }
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(|row| DockerContainerInfo {
+    map_docker_list_result::<DockerPsRow, _, _>(
+        result.exit_code,
+        &result.stdout,
+        &result.stderr,
+        |row| DockerContainerInfo {
             id: row.id,
             names: row.names.trim_start_matches('/').to_string(),
             image: row.image,
@@ -176,8 +226,8 @@ pub async fn docker_list_containers(
             state: row.state,
             ports: row.ports,
             created: row.created,
-        })
-        .collect())
+        },
+    )
 }
 
 #[tauri::command]
@@ -199,20 +249,11 @@ pub async fn docker_list_images(
     .await
     .map_err(|e| e.to_string())?;
 
-    let rows = match parse_json_stream::<DockerImagesRow>(&result.output) {
-        Ok(rows) if !rows.is_empty() || result.exit_code == 0 => rows,
-        Ok(_) => return Err(docker_failure_message(result.exit_code, &result.output)),
-        Err(parse_err) => {
-            if result.exit_code != 0 {
-                return Err(docker_failure_message(result.exit_code, &result.output));
-            }
-            return Err(parse_err);
-        }
-    };
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
+    map_docker_list_result::<DockerImagesRow, _, _>(
+        result.exit_code,
+        &result.stdout,
+        &result.stderr,
+        |row| {
             let created = row.created_display();
             DockerImageInfo {
                 id: row.id,
@@ -221,8 +262,8 @@ pub async fn docker_list_images(
                 size: row.size,
                 created,
             }
-        })
-        .collect())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -256,5 +297,29 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].repository, "debian");
         assert_eq!(rows[0].created_display(), "2026-07-15 14:04:43 +0800 CST");
+    }
+
+    #[test]
+    fn skips_banner_before_json() {
+        let raw = "Welcome to Ubuntu\nLast login: today\n{\"ID\":\"abc\",\"Names\":\"/foo\",\"Image\":\"img\",\"Status\":\"Up\",\"State\":\"running\",\"Ports\":\"\",\"CreatedAt\":\"now\"}\n";
+        let rows = parse_json_stream::<DockerPsRow>(raw).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "abc");
+    }
+
+    #[test]
+    fn empty_stdout_is_ok() {
+        let rows = parse_json_stream::<DockerPsRow>("").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn non_json_error_includes_snippet() {
+        let err = match parse_json_stream::<DockerPsRow>("Cannot connect to the Docker daemon") {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("不是 JSON"));
+        assert!(err.contains("Cannot connect"));
     }
 }

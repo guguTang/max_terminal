@@ -17,12 +17,20 @@ pub struct SessionInner {
     pub sftp_handle: client::Handle<SshHandler>,
     pub terminal_handle: client::Handle<SshHandler>,
     pub terminal_io_lock: Mutex<()>,
+    /// Serializes SFTP channel ops. Held separately from `SharedSession` so
+    /// `terminal_input` can look up PTY handles without waiting on transfers.
+    pub sftp_io_lock: Arc<Mutex<()>>,
     pub sftp: SftpSession,
     pub terminals: HashMap<String, Arc<crate::ssh::pty::TerminalHandle>>,
     pub terminal_meta: HashMap<String, TerminalMeta>,
 }
 
 pub type SharedSession = Arc<Mutex<SessionInner>>;
+
+/// Clone the SFTP IO lock without holding the session mutex.
+pub async fn sftp_io_lock(session: &SharedSession) -> Arc<Mutex<()>> {
+    session.lock().await.sftp_io_lock.clone()
+}
 
 pub struct SessionManager {
     sessions: HashMap<String, SharedSession>,
@@ -82,22 +90,49 @@ impl SessionInner {
         self.terminal_handle = open_ssh_transport(&self.connection).await?;
         Ok(())
     }
+
+    pub async fn reconnect_sftp_transport(&mut self) -> Result<()> {
+        self.sftp_handle
+            .disconnect(Disconnect::ByApplication, "", "")
+            .await
+            .ok();
+        self.sftp_handle = open_ssh_transport(&self.connection).await?;
+        self.sftp = open_sftp_session(&self.sftp_handle).await?;
+        if let Ok(home) = self.sftp.canonicalize(".").await {
+            self.home_path = home;
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_sftp_alive(&mut self) -> Result<()> {
+        match self.sftp.canonicalize(".").await {
+            Ok(home) => {
+                self.home_path = home;
+                Ok(())
+            }
+            Err(_) => self.reconnect_sftp_transport().await,
+        }
+    }
+}
+
+/// Ping SFTP (and reconnect the SFTP transport if the idle TCP is dead).
+pub async fn ensure_sftp_alive(session: &SharedSession) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _guard = sftp_io.lock().await;
+    let mut inner = session.lock().await;
+    inner.ensure_sftp_alive().await
+}
+
+pub async fn reconnect_sftp(session: &SharedSession) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _guard = sftp_io.lock().await;
+    let mut inner = session.lock().await;
+    inner.reconnect_sftp_transport().await
 }
 
 pub async fn connect(record: &ConnectionRecord) -> Result<(String, SharedSession)> {
     let sftp_handle = open_ssh_transport(record).await?;
-
-    let channel = sftp_handle
-        .channel_open_session()
-        .await
-        .context("Failed to open SFTP channel")?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .context("Failed to start SFTP subsystem")?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .context("Failed to initialize SFTP session")?;
+    let sftp = open_sftp_session(&sftp_handle).await?;
 
     let home_path = sftp
         .canonicalize(".")
@@ -113,12 +148,30 @@ pub async fn connect(record: &ConnectionRecord) -> Result<(String, SharedSession
         sftp_handle,
         terminal_handle,
         terminal_io_lock: Mutex::new(()),
+        sftp_io_lock: Arc::new(Mutex::new(())),
         sftp,
         terminals: HashMap::new(),
         terminal_meta: HashMap::new(),
     }));
 
     Ok((session_id, session))
+}
+
+async fn open_sftp_session(handle: &client::Handle<SshHandler>) -> Result<SftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("Failed to open SFTP channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("Failed to start SFTP subsystem")?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .context("Failed to initialize SFTP session")?;
+    // Default russh-sftp timeout is 10s; a half-dead TCP then looks like a hang/disconnect.
+    sftp.set_timeout(60);
+    Ok(sftp)
 }
 
 async fn open_ssh_transport(record: &ConnectionRecord) -> Result<client::Handle<SshHandler>> {

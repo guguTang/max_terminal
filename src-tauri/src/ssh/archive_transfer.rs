@@ -90,7 +90,7 @@ async fn remote_remove_file(session: &SharedSession, path: &str) -> Result<()> {
 pub async fn upload_directory_compressed<F>(
     session: &SharedSession,
     local_dir: &str,
-    remote_dir: &str,
+    remote_dest: &str,
     cancel: &AtomicBool,
     mut report: F,
 ) -> Result<u64>
@@ -103,9 +103,14 @@ where
     if name.is_empty() {
         return Err(anyhow!("Invalid local directory path"));
     }
+    // Tar already contains top-level `name/`; extract into the parent of remote_dest.
+    let (remote_parent, _) = split_parent_name(remote_dest);
+    if remote_parent.is_empty() {
+        return Err(anyhow!("Invalid remote destination path"));
+    }
 
     let local_archive = temp_local_archive();
-    let remote_archive = join_ui_path(remote_dir, &format!(".mx-txfer-{name}.tar.gz"));
+    let remote_archive = join_ui_path(&remote_parent, &format!(".mx-txfer-{name}.tar.gz"));
 
     report_phase(&mut report, "compressing")?;
     ensure_not_cancelled(cancel)?;
@@ -128,7 +133,7 @@ where
 
     report_phase(&mut report, "extracting")?;
     ensure_not_cancelled(cancel)?;
-    extract_local_tar_gz_to_remote_dir(session, &local_archive, remote_dir, cancel).await?;
+    extract_local_tar_gz_to_remote_dir(session, &local_archive, &remote_parent, cancel).await?;
 
     report_phase(&mut report, "cleaning")?;
     let _ = remote_remove_file(session, &remote_archive).await;
@@ -146,7 +151,7 @@ where
 pub async fn download_directory_compressed<F>(
     session: &SharedSession,
     remote_dir: &str,
-    local_parent: &str,
+    local_dest: &str,
     cancel: &AtomicBool,
     mut report: F,
 ) -> Result<u64>
@@ -159,6 +164,10 @@ where
     if name.is_empty() {
         return Err(anyhow!("Invalid remote directory path"));
     }
+    // Tar already contains top-level `name/`; extract into the parent of local_dest.
+    let extract_parent = Path::new(local_dest)
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid local destination path"))?;
 
     let local_archive = temp_local_archive();
 
@@ -181,7 +190,7 @@ where
 
     report_phase(&mut report, "extracting")?;
     ensure_not_cancelled(cancel)?;
-    local_tar_extract(&local_archive, Path::new(local_parent)).await?;
+    local_tar_extract(&local_archive, extract_parent).await?;
 
     let total = std::fs::metadata(&local_archive)
         .map(|meta| meta.len())
@@ -203,7 +212,7 @@ pub async fn copy_remote_directory_compressed<F>(
     source: &SharedSession,
     dest: &SharedSession,
     source_dir: &str,
-    dest_dir: &str,
+    dest_path: &str,
     cancel: &AtomicBool,
     mut report: F,
 ) -> Result<u64>
@@ -216,13 +225,18 @@ where
     if name.is_empty() {
         return Err(anyhow!("Invalid source directory path"));
     }
+    // Tar already contains top-level `name/`; extract into the parent of dest_path
+    // so the result is parent/name/... (not parent/name/name/...).
+    let (dest_parent, _) = split_parent_name(dest_path);
+    if dest_parent.is_empty() {
+        return Err(anyhow!("Invalid destination path"));
+    }
 
     let local_archive = temp_local_archive();
-    let dest_archive = join_ui_path(dest_dir, &format!(".mx-txfer-{name}.tar.gz"));
 
     report_phase(&mut report, "compressing")?;
     ensure_not_cancelled(cancel)?;
-    create_local_tar_gz_from_remote_dir(
+    let archive_size = create_local_tar_gz_from_remote_dir(
         source,
         source_dir,
         &local_archive,
@@ -237,36 +251,22 @@ where
     )
     .await?;
 
-    let total = upload_local_path_with_progress(
-        dest,
-        local_archive.to_string_lossy().as_ref(),
-        &dest_archive,
-        cancel,
-        |progress| {
-            report(TransferProgress {
-                phase: "transferring",
-                loaded_bytes: progress.loaded_bytes,
-                total_bytes: progress.total_bytes,
-            })
-        },
-    )
-    .await?;
-
+    // Extract straight from the local archive over SFTP — do not upload the
+    // unused .tar.gz to the destination (that was a full extra hop).
     report_phase(&mut report, "extracting")?;
     ensure_not_cancelled(cancel)?;
-    extract_local_tar_gz_to_remote_dir(dest, &local_archive, dest_dir, cancel).await?;
+    extract_local_tar_gz_to_remote_dir(dest, &local_archive, &dest_parent, cancel).await?;
 
     report_phase(&mut report, "cleaning")?;
-    let _ = remote_remove_file(dest, &dest_archive).await;
     let _ = tokio::fs::remove_file(&local_archive).await;
 
     report(TransferProgress {
         phase: "transferring",
-        loaded_bytes: total,
-        total_bytes: Some(total),
+        loaded_bytes: archive_size,
+        total_bytes: Some(archive_size),
     })?;
 
-    Ok(total)
+    Ok(archive_size)
 }
 
 pub async fn path_is_remote_dir(session: &SharedSession, path: &str) -> Result<bool> {
@@ -278,4 +278,21 @@ pub async fn path_is_local_dir(path: &str) -> Result<bool> {
         .await
         .map_err(|e| anyhow!("Failed to read local path metadata: {e}"))?;
     Ok(meta.is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_parent_name;
+
+    #[test]
+    fn split_parent_name_for_remote_dest() {
+        assert_eq!(
+            split_parent_name("/home/user/folder"),
+            ("/home/user".to_string(), "folder".to_string())
+        );
+        assert_eq!(
+            split_parent_name("/folder"),
+            ("/".to_string(), "folder".to_string())
+        );
+    }
 }

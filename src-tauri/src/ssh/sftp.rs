@@ -1,5 +1,6 @@
-use crate::ssh::session::SharedSession;
+use crate::ssh::session::{sftp_io_lock, SharedSession};
 use anyhow::{anyhow, Result};
+use russh_sftp::client::fs::File as SftpFile;
 use russh_sftp::protocol::FileType;
 use serde::Serialize;
 use std::path::Path;
@@ -7,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
-const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
+/// Larger chunks cut SFTP round-trips; still below typical max packet aggregation.
+const TRANSFER_CHUNK_SIZE: usize = 512 * 1024;
+/// Avoid hammering the UI / transfer task mutex on every chunk.
+const PROGRESS_REPORT_EVERY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransferProgress {
@@ -24,6 +28,50 @@ pub(crate) fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
     }
 }
 
+pub(crate) fn is_sftp_transport_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("timeout")
+        || lower.contains("connection lost")
+        || lower.contains("no connection")
+        || lower.contains("broken pipe")
+        || lower.contains("channel closed")
+        || lower.contains("disconnected")
+        || lower.contains("keepalive")
+        || lower.contains("connection reset")
+        || lower.contains("not connected")
+        || lower.contains("eof")
+        || lower.contains("i/o:")
+}
+
+/// Properly close an SFTP file handle.
+/// Drop alone uses close_nowait and does NOT decrement russh-sftp's open-handle
+/// counter (limits@openssh.com), which eventually yields "handle limit reached"
+/// and makes the destination session look dead after many files.
+async fn close_sftp_file(file: &mut SftpFile) -> Result<()> {
+    file.shutdown()
+        .await
+        .map_err(|e| anyhow!("Failed to close remote file: {e}"))
+}
+
+async fn ensure_remote_dir(session: &SharedSession, ui_path: &str) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
+    let sftp_path = {
+        let inner = session.lock().await;
+        ui_to_sftp(ui_path, &inner.home_path)
+    };
+    let inner = session.lock().await;
+    match inner.sftp.metadata(&sftp_path).await {
+        Ok(meta) if meta.file_type() == FileType::Dir => Ok(()),
+        Ok(_) => Err(anyhow!("Destination exists and is not a directory: {ui_path}")),
+        Err(_) => inner
+            .sftp
+            .create_dir(&sftp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create destination directory: {e}")),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
@@ -35,6 +83,8 @@ pub struct FileEntry {
 }
 
 pub async fn list_dir(session: &SharedSession, path: &str) -> Result<Vec<FileEntry>> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let inner = session.lock().await;
     let sftp_path = ui_to_sftp(path, &inner.home_path);
     let parent_abs = inner
@@ -69,14 +119,7 @@ pub async fn list_dir(session: &SharedSession, path: &str) -> Result<Vec<FileEnt
 }
 
 pub async fn read_file(session: &SharedSession, path: &str) -> Result<String> {
-    let sftp_path = {
-        let inner = session.lock().await;
-        ui_to_sftp(path, &inner.home_path)
-    };
-    let data = {
-        let inner = session.lock().await;
-        inner.sftp.read(&sftp_path).await?
-    };
+    let data = read_file_bytes(session, path).await?;
     if data.len() > MAX_READ_BYTES {
         return Err(anyhow!(
             "File too large to preview (max {} MB)",
@@ -90,47 +133,51 @@ pub async fn read_file(session: &SharedSession, path: &str) -> Result<String> {
 }
 
 pub async fn write_file(session: &SharedSession, path: &str, content: &str) -> Result<()> {
-    let sftp_path = {
-        let inner = session.lock().await;
-        ui_to_sftp(path, &inner.home_path)
-    };
-    let inner = session.lock().await;
-    let mut file = inner
-        .sftp
-        .create(&sftp_path)
-        .await
-        .map_err(|e| anyhow!("Failed to create file: {e}"))?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, content.as_bytes())
-        .await
-        .map_err(|e| anyhow!("Failed to write file: {e}"))
+    write_file_bytes(session, path, content.as_bytes()).await
 }
 
 pub async fn read_file_bytes(session: &SharedSession, path: &str) -> Result<Vec<u8>> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
     };
-    let data = {
+    let mut file = {
         let inner = session.lock().await;
-        inner.sftp.read(&sftp_path).await?
+        inner
+            .sftp
+            .open(&sftp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open file: {e}"))?
     };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .await
+        .map_err(|e| anyhow!("Failed to read file: {e}"))?;
+    close_sftp_file(&mut file).await?;
     Ok(data)
 }
 
 pub async fn write_file_bytes(session: &SharedSession, path: &str, content: &[u8]) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
     };
-    let inner = session.lock().await;
-    let mut file = inner
-        .sftp
-        .create(&sftp_path)
+    let mut file = {
+        let inner = session.lock().await;
+        inner
+            .sftp
+            .create(&sftp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create file: {e}"))?
+    };
+    file.write_all(content)
         .await
-        .map_err(|e| anyhow!("Failed to create file: {e}"))?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, content)
-        .await
-        .map_err(|e| anyhow!("Failed to write file: {e}"))
+        .map_err(|e| anyhow!("Failed to write file: {e}"))?;
+    close_sftp_file(&mut file).await
 }
 
 pub async fn remove_path(session: &SharedSession, path: &str, is_dir: bool) -> Result<()> {
@@ -141,6 +188,8 @@ pub async fn remove_path(session: &SharedSession, path: &str, is_dir: bool) -> R
 }
 
 async fn remove_file(session: &SharedSession, path: &str) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
@@ -162,6 +211,8 @@ async fn remove_dir_recursive(session: &SharedSession, path: &str) -> Result<()>
             remove_file(session, &entry.path).await?;
         }
     }
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
@@ -175,6 +226,8 @@ async fn remove_dir_recursive(session: &SharedSession, path: &str) -> Result<()>
 }
 
 pub async fn rename_path(session: &SharedSession, path: &str, new_path: &str) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let (old_sftp_path, new_sftp_path) = {
         let inner = session.lock().await;
         (
@@ -243,18 +296,23 @@ where
         .await
         .map_err(|e| anyhow!("Failed to open local file: {e}"))?;
 
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(remote_path, &inner.home_path)
     };
-    let inner = session.lock().await;
-    let mut remote_file = inner
-        .sftp
-        .create(&sftp_path)
-        .await
-        .map_err(|e| anyhow!("Failed to create remote file: {e}"))?;
+    let mut remote_file = {
+        let inner = session.lock().await;
+        inner
+            .sftp
+            .create(&sftp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create remote file: {e}"))?
+    };
 
     let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    let mut last_reported = *loaded;
     loop {
         ensure_not_cancelled(cancel)?;
         let n = local_file
@@ -269,9 +327,15 @@ where
             .await
             .map_err(|e| anyhow!("Failed to write remote file: {e}"))?;
         *loaded += n as u64;
+        if *loaded - last_reported >= PROGRESS_REPORT_EVERY_BYTES {
+            on_progress(*loaded, total_bytes)?;
+            last_reported = *loaded;
+        }
+    }
+    if *loaded != last_reported {
         on_progress(*loaded, total_bytes)?;
     }
-    Ok(())
+    close_sftp_file(&mut remote_file).await
 }
 
 async fn upload_local_path_recursive<F>(
@@ -289,18 +353,7 @@ where
 {
     ensure_not_cancelled(cancel)?;
     if is_dir {
-        let dest_sftp_path = {
-            let inner = session.lock().await;
-            ui_to_sftp(remote_path, &inner.home_path)
-        };
-        {
-            let inner = session.lock().await;
-            inner
-                .sftp
-                .create_dir(&dest_sftp_path)
-                .await
-                .map_err(|e| anyhow!("Failed to create remote directory: {e}"))?;
-        }
+        ensure_remote_dir(session, remote_path).await?;
 
         let mut rd = tokio::fs::read_dir(local_path)
             .await
@@ -404,6 +457,8 @@ pub(crate) fn join_ui_path(dir: &str, name: &str) -> String {
 }
 
 pub(crate) async fn remote_path_is_dir(session: &SharedSession, path: &str) -> Result<bool> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(path, &inner.home_path)
@@ -425,6 +480,8 @@ pub(crate) async fn remote_path_total_bytes(
 ) -> Result<u64> {
     ensure_not_cancelled(cancel)?;
     if !is_dir {
+        let sftp_io = sftp_io_lock(session).await;
+        let _sftp_guard = sftp_io.lock().await;
         let sftp_path = {
             let inner = session.lock().await;
             ui_to_sftp(path, &inner.home_path)
@@ -452,13 +509,13 @@ async fn copy_remote_file<F>(
     dest: &SharedSession,
     source_path: &str,
     dest_path: &str,
-    total_bytes: u64,
+    total_bytes: Option<u64>,
     loaded: &mut u64,
     cancel: &AtomicBool,
     on_progress: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(u64, u64) -> Result<()>,
+    F: FnMut(u64, Option<u64>) -> Result<()>,
 {
     let source_sftp_path = {
         let inner = source.lock().await;
@@ -467,6 +524,21 @@ where
     let dest_sftp_path = {
         let inner = dest.lock().await;
         ui_to_sftp(dest_path, &inner.home_path)
+    };
+
+    // Serialize SFTP IO on both sides without holding SessionInner locks, so
+    // terminal_input can still resolve PTY handles during long transfers.
+    // Lock order by Arc pointer to avoid A↔B / B↔A deadlocks.
+    let source_io = sftp_io_lock(source).await;
+    let dest_io = sftp_io_lock(dest).await;
+    let source_ptr = std::sync::Arc::as_ptr(&source_io) as usize;
+    let dest_ptr = std::sync::Arc::as_ptr(&dest_io) as usize;
+    let (_first_guard, _second_guard) = if source_ptr <= dest_ptr {
+        (source_io.lock().await, dest_io.lock().await)
+    } else {
+        let dest_guard = dest_io.lock().await;
+        let source_guard = source_io.lock().await;
+        (source_guard, dest_guard)
     };
 
     let mut source_file = {
@@ -486,23 +558,52 @@ where
             .map_err(|e| anyhow!("Failed to create destination file: {e}"))?
     };
 
-    let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    // Pipeline: read next chunk from A while writing the previous chunk to B.
+    let mut read_buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    let mut write_buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    let mut write_len = 0_usize;
+    let mut last_reported = *loaded;
+    let mut primed = false;
+
     loop {
         ensure_not_cancelled(cancel)?;
-        let n = source_file
-            .read(&mut buffer)
-            .await
-            .map_err(|e| anyhow!("Failed to read source file: {e}"))?;
+        if !primed {
+            let n = source_file
+                .read(&mut read_buf)
+                .await
+                .map_err(|e| anyhow!("Failed to read source file: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            std::mem::swap(&mut read_buf, &mut write_buf);
+            write_len = n;
+            primed = true;
+            continue;
+        }
+
+        let write_fut = dest_file.write_all(&write_buf[..write_len]);
+        let read_fut = source_file.read(&mut read_buf);
+        let (write_res, read_res) = tokio::join!(write_fut, read_fut);
+        write_res.map_err(|e| anyhow!("Failed to write destination file: {e}"))?;
+        *loaded += write_len as u64;
+        if *loaded - last_reported >= PROGRESS_REPORT_EVERY_BYTES {
+            on_progress(*loaded, total_bytes)?;
+            last_reported = *loaded;
+        }
+
+        let n = read_res.map_err(|e| anyhow!("Failed to read source file: {e}"))?;
         if n == 0 {
             break;
         }
-        dest_file
-            .write_all(&buffer[..n])
-            .await
-            .map_err(|e| anyhow!("Failed to write destination file: {e}"))?;
-        *loaded += n as u64;
+        std::mem::swap(&mut read_buf, &mut write_buf);
+        write_len = n;
+    }
+
+    if *loaded != last_reported {
         on_progress(*loaded, total_bytes)?;
     }
+    close_sftp_file(&mut dest_file).await?;
+    close_sftp_file(&mut source_file).await?;
     Ok(())
 }
 
@@ -512,28 +613,17 @@ async fn copy_remote_path_recursive<F>(
     source_path: &str,
     dest_path: &str,
     is_dir: bool,
-    total_bytes: u64,
+    total_bytes: Option<u64>,
     loaded: &mut u64,
     cancel: &AtomicBool,
     on_progress: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(u64, u64) -> Result<()>,
+    F: FnMut(u64, Option<u64>) -> Result<()>,
 {
     ensure_not_cancelled(cancel)?;
     if is_dir {
-        let dest_sftp_path = {
-            let inner = dest.lock().await;
-            ui_to_sftp(dest_path, &inner.home_path)
-        };
-        {
-            let inner = dest.lock().await;
-            inner
-                .sftp
-                .create_dir(&dest_sftp_path)
-                .await
-                .map_err(|e| anyhow!("Failed to create destination directory: {e}"))?;
-        }
+        ensure_remote_dir(dest, dest_path).await?;
 
         let entries = list_dir(source, source_path).await?;
         for entry in entries {
@@ -580,27 +670,33 @@ where
     F: FnMut(TransferProgress) -> Result<()>,
 {
     report(TransferProgress {
-        phase: "preparing",
+        phase: "transferring",
         loaded_bytes: 0,
         total_bytes: None,
     })?;
     ensure_not_cancelled(cancel)?;
 
+    // Skip a full recursive size scan (extra RTT per file). Progress shows bytes
+    // transferred; total stays unknown unless this is a single file.
     let is_dir = remote_path_is_dir(source, source_path).await?;
     ensure_not_cancelled(cancel)?;
-    let total_bytes = remote_path_total_bytes(source, source_path, is_dir, cancel).await?;
+    let total_bytes = if is_dir {
+        None
+    } else {
+        Some(remote_path_total_bytes(source, source_path, false, cancel).await?)
+    };
     report(TransferProgress {
         phase: "transferring",
         loaded_bytes: 0,
-        total_bytes: Some(total_bytes),
+        total_bytes,
     })?;
 
     let mut loaded = 0_u64;
-    let mut on_progress = |loaded_bytes: u64, total: u64| {
+    let mut on_progress = |loaded_bytes: u64, total: Option<u64>| {
         report(TransferProgress {
             phase: "transferring",
             loaded_bytes,
-            total_bytes: Some(total),
+            total_bytes: total,
         })
     };
     copy_remote_path_recursive(
@@ -615,7 +711,7 @@ where
         &mut on_progress,
     )
     .await?;
-    Ok(total_bytes)
+    Ok(loaded)
 }
 
 async fn download_single_remote_file<F>(
@@ -635,15 +731,6 @@ where
         ui_to_sftp(remote_path, &inner.home_path)
     };
 
-    let mut remote_file = {
-        let inner = session.lock().await;
-        inner
-            .sftp
-            .open(&remote_sftp_path)
-            .await
-            .map_err(|e| anyhow!("Failed to open remote file: {e}"))?
-    };
-
     let local = Path::new(local_path);
     if let Some(parent) = local.parent() {
         tokio::fs::create_dir_all(parent)
@@ -654,7 +741,19 @@ where
         .await
         .map_err(|e| anyhow!("Failed to create local file: {e}"))?;
 
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
+    let mut remote_file = {
+        let inner = session.lock().await;
+        inner
+            .sftp
+            .open(&remote_sftp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open remote file: {e}"))?
+    };
+
     let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    let mut last_reported = *loaded;
     loop {
         ensure_not_cancelled(cancel)?;
         let n = remote_file
@@ -669,9 +768,15 @@ where
             .await
             .map_err(|e| anyhow!("Failed to write local file: {e}"))?;
         *loaded += n as u64;
+        if *loaded - last_reported >= PROGRESS_REPORT_EVERY_BYTES {
+            on_progress(*loaded, total_bytes)?;
+            last_reported = *loaded;
+        }
+    }
+    if *loaded != last_reported {
         on_progress(*loaded, total_bytes)?;
     }
-    Ok(())
+    close_sftp_file(&mut remote_file).await
 }
 
 async fn download_remote_path_recursive<F>(
@@ -780,4 +885,19 @@ pub fn ui_to_sftp(path: &str, home: &str) -> String {
         return ".".to_string();
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sftp_transport_error;
+
+    #[test]
+    fn transport_errors_are_detected() {
+        assert!(is_sftp_transport_error("Timeout"));
+        assert!(is_sftp_transport_error("I/O: Connection reset by peer"));
+        assert!(is_sftp_transport_error("channel closed"));
+        assert!(is_sftp_transport_error("KeepaliveTimeout"));
+        assert!(!is_sftp_transport_error("Permission denied"));
+        assert!(!is_sftp_transport_error("No such file"));
+    }
 }

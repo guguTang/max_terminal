@@ -10,10 +10,19 @@ import {
   Loader2,
   ChevronDown,
   ChevronRight,
+  Download,
+  Upload,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { Connection } from "../types/connection";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useSessionStore } from "../stores/sessionStore";
+import {
+  buildConnectionBackup,
+  parseConnectionBackup,
+  utf8ToBase64,
+} from "../lib/connectionBackup";
 import { ConnectionDialog } from "./ConnectionDialog";
 
 const UNGROUPED_KEY = "";
@@ -60,6 +69,8 @@ export function ConnectionList() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Connection | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [ioBusy, setIoBusy] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
 
   useEffect(() => {
@@ -119,6 +130,75 @@ export function ConnectionList() {
   const handleSave = async (conn: Connection) => {
     await saveConnection(conn);
     setEditing(null);
+  };
+
+  const handleExport = async () => {
+    setLocalError(null);
+    setNotice(null);
+    if (connections.length === 0) {
+      setLocalError("没有可导出的连接");
+      return;
+    }
+    setIoBusy(true);
+    try {
+      const target = await save({
+        title: "导出连接配置",
+        defaultPath: `max-terminal-connections-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!target) return;
+      const payload = buildConnectionBackup(connections);
+      const text = JSON.stringify(payload, null, 2);
+      await invoke("save_local_file_base64", {
+        path: target,
+        contentBase64: utf8ToBase64(text),
+      });
+      setNotice(`已导出 ${connections.length} 条连接`);
+    } catch (e) {
+      setLocalError(String(e));
+    } finally {
+      setIoBusy(false);
+    }
+  };
+
+  const handleImport = async () => {
+    setLocalError(null);
+    setNotice(null);
+    setIoBusy(true);
+    try {
+      const selected = await open({
+        title: "导入连接配置",
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      const text = await invoke<string>("read_local_text_file", { path: selected });
+      const imported = parseConnectionBackup(text);
+      if (imported.length === 0) {
+        setLocalError("备份文件中没有连接");
+        return;
+      }
+
+      const existingIds = new Set(connections.map((c) => c.id));
+      let created = 0;
+      let updated = 0;
+      for (const item of imported) {
+        if (item.id && existingIds.has(item.id)) {
+          await saveConnection(item);
+          updated += 1;
+        } else {
+          await saveConnection({ ...item, id: "" });
+          created += 1;
+        }
+      }
+      await fetchConnections();
+      setNotice(`导入完成：新增 ${created}，更新 ${updated}`);
+    } catch (e) {
+      setLocalError(String(e));
+    } finally {
+      setIoBusy(false);
+    }
   };
 
   const toggleGroup = (key: string) => {
@@ -248,15 +328,43 @@ export function ConnectionList() {
       >
         <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 shrink-0">
           <span className="text-sm font-medium text-zinc-300">连接</span>
-          <button
-            type="button"
-            onClick={openNewDialog}
-            className="flex items-center gap-1 rounded-md bg-blue-600 hover:bg-blue-500 px-2 py-1 text-xs text-white"
-          >
-            <Plus size={14} />
-            添加
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => void handleImport()}
+              disabled={ioBusy}
+              className="flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+              title="从 JSON 导入连接（含密码/私钥）"
+            >
+              <Upload size={13} />
+              导入
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleExport()}
+              disabled={ioBusy || connections.length === 0}
+              className="flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+              title="导出全部连接到 JSON（含密码/私钥）"
+            >
+              <Download size={13} />
+              导出
+            </button>
+            <button
+              type="button"
+              onClick={openNewDialog}
+              className="flex items-center gap-1 rounded-md bg-blue-600 hover:bg-blue-500 px-2 py-1 text-xs text-white"
+            >
+              <Plus size={14} />
+              添加
+            </button>
+          </div>
         </div>
+
+        {notice && (
+          <p className="px-3 py-1.5 text-xs text-emerald-400 border-b border-zinc-900 shrink-0">
+            {notice}
+          </p>
+        )}
 
         {displayError && (
           <p className="px-3 py-1.5 text-xs text-red-400 border-b border-zinc-900 shrink-0">

@@ -160,6 +160,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       await captureConnectionWorkspaceSnapshot(prevConnectionId, prevSessionId);
     }
 
+    let ensureError: string | null = null;
+    try {
+      await invoke("session_ensure_alive", { sessionId: target.sessionId });
+    } catch (e) {
+      ensureError = String(e);
+    }
+
     set({
       activeSessionId: target.sessionId,
       sessionId: target.sessionId,
@@ -168,7 +175,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       connected: true,
       connecting: false,
       connectingId: null,
-      error: null,
+      error: ensureError,
       selectedFile: selectedFileForConnection(connectionId),
       sshViewMode: "session",
     });

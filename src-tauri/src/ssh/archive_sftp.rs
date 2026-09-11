@@ -1,4 +1,4 @@
-use crate::ssh::session::SharedSession;
+use crate::ssh::session::{sftp_io_lock, SharedSession};
 use crate::ssh::sftp::{
     ensure_not_cancelled, join_ui_path, list_dir, read_file_bytes, remote_path_total_bytes,
     ui_to_sftp, write_file_bytes,
@@ -53,6 +53,8 @@ async fn collect_remote_tar_entries(
 }
 
 async fn ensure_remote_directory(session: &SharedSession, ui_path: &str) -> Result<()> {
+    let sftp_io = sftp_io_lock(session).await;
+    let _sftp_guard = sftp_io.lock().await;
     let sftp_path = {
         let inner = session.lock().await;
         ui_to_sftp(ui_path, &inner.home_path)

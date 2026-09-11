@@ -204,6 +204,7 @@ function TreeNode({
         onClick={toggle}
         onContextMenu={(event) => {
           event.preventDefault();
+          event.stopPropagation();
           onContextMenu(entry, event);
         }}
       >
@@ -302,6 +303,7 @@ export function RemoteFileTree({
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [mutation, setMutation] = useState<TreeMutation | null>(null);
   const mutationSeqRef = useRef(0);
+  const menuRef = useRef<HTMLDivElement>(null);
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -534,16 +536,32 @@ export function RemoteFileTree({
   }, [sessionId, currentPath, reloadKey]);
 
   useEffect(() => {
+    if (!menu) return;
+
     const close = () => setMenu(null);
-    window.addEventListener("click", close);
-    window.addEventListener("resize", close);
-    window.addEventListener("scroll", close, true);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, true);
+
+    const handleOutside = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (menuRef.current?.contains(target)) return;
+      close();
     };
-  }, []);
+
+    // macOS Ctrl+click fires contextmenu then a synthetic click; defer listeners
+    // so the same gesture does not open and immediately close the menu.
+    const timer = window.setTimeout(() => {
+      window.addEventListener("mousedown", handleOutside, true);
+      window.addEventListener("scroll", close, true);
+      window.addEventListener("resize", close);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("mousedown", handleOutside, true);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [menu]);
 
   const pollTransfer = useCallback(async (taskId: string): Promise<TransferTaskSnapshot> => {
     while (true) {
@@ -1357,6 +1375,8 @@ export function RemoteFileTree({
               onExpandedChange={handleExpandedChange}
               mutation={mutation}
               onContextMenu={(target, event) => {
+                event.preventDefault();
+                event.stopPropagation();
                 const itemHeight = 34;
                 const itemCount = target.isDir ? 8 : 7;
                 const menuHeight = itemHeight * itemCount + 8;
@@ -1380,8 +1400,10 @@ export function RemoteFileTree({
       </div>
       {menu && (
         <div
+          ref={menuRef}
           className="fixed z-[200] min-w-44 max-h-[min(70vh,360px)] overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 py-1 shadow-xl"
           style={{ left: menu.x, top: menu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
         >
           {menuItems.map((item) => (

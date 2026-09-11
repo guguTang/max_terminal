@@ -173,7 +173,7 @@ async fn run_shell(
         let session = session.ok_or_else(|| anyhow!("SSH session required"))?;
         let result = run_remote_command_with_output(session, &command).await?;
         Ok(ShellOutput {
-            stdout: result.output,
+            stdout: result.stdout,
             exit_code: result.exit_code,
         })
     }

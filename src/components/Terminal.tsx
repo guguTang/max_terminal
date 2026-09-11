@@ -3,7 +3,8 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { invoke } from "@tauri-apps/api/core";
-import type { TerminalCreateOptions } from "../types/connection";
+import { listen } from "@tauri-apps/api/event";
+import type { TerminalClosedEvent, TerminalCreateOptions } from "../types/connection";
 import { LOCAL_SESSION_ID } from "../stores/localConsoleStore";
 import { useSessionStore } from "../stores/sessionStore";
 import { useTerminalMetaStore } from "../stores/terminalMetaStore";
@@ -284,6 +285,14 @@ export function Terminal({
     let onResizeDispose: (() => void) | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let resizeDebounce: ReturnType<typeof setTimeout> | null = null;
+    let unlistenClosed: (() => void) | null = null;
+    let recoveringPty = false;
+    const recoverPtyRef = { current: null as null | ((reason: string) => Promise<void>) };
+
+    const isChannelClosedError = (err: unknown) => {
+      const msg = String(err);
+      return msg.includes("channel closed") || msg.includes("Terminal channel closed");
+    };
 
     const scheduleSizeSync = () => {
       for (const delay of SIZE_SYNC_DELAYS_MS) {
@@ -328,7 +337,50 @@ export function Terminal({
             sessionId: boundSessionId,
             data,
             terminalId,
-          }).catch(console.error);
+          }).catch((e) => {
+            if (isChannelClosedError(e)) {
+              void recoverPtyRef.current?.("SSH 连接已断开，正在重连…");
+              return;
+            }
+            console.error(e);
+          });
+        }
+      };
+
+      recoverPtyRef.current = async (reason: string) => {
+        if (isStale() || isLocal || recoveringPty) return;
+        recoveringPty = true;
+        ptyReadyRef.current = false;
+        term.writeln(`\r\n\x1b[33m${reason}\x1b[0m`);
+        delete lastPtySizeByKey[`${boundSessionId}:${terminalId}`];
+        try {
+          await invoke("terminal_destroy", {
+            sessionId: boundSessionId,
+            terminalId,
+          }).catch(() => {});
+          if (isStale()) return;
+          const liveCwd = cwdRef.current;
+          const options: TerminalCreateOptions = {
+            cols: Math.max(term.cols, 1),
+            rows: Math.max(term.rows, 1),
+            ...(liveCwd && liveCwd !== resolvedHomePath ? { initialCwd: liveCwd } : {}),
+          };
+          await invoke("terminal_create", {
+            sessionId: boundSessionId,
+            terminalId,
+            options,
+          });
+          if (isStale()) return;
+          ptyReadyRef.current = true;
+          flushPendingInput();
+          await syncPtySize(term, fit, boundSessionId, terminalId, true);
+          term.writeln("\x1b[32m已重新连接\x1b[0m");
+        } catch (e) {
+          if (!isStale()) {
+            term.writeln(`\x1b[31m重连失败: ${e}\x1b[0m`);
+          }
+        } finally {
+          recoveringPty = false;
         }
       };
 
@@ -352,7 +404,13 @@ export function Terminal({
           sessionId: boundSessionId,
           data,
           terminalId,
-        }).catch(console.error);
+        }).catch((e) => {
+          if (isChannelClosedError(e)) {
+            void recoverPtyRef.current?.("SSH 连接已断开，正在重连…");
+            return;
+          }
+          console.error(e);
+        });
       }).dispose;
 
       try {
@@ -410,7 +468,35 @@ export function Terminal({
 
         ptyReadyRef.current = true;
         flushPendingInput();
-        await syncPtySize(term, fit, boundSessionId, terminalId, true);
+
+        const ensureSized = async () => {
+          try {
+            await syncPtySize(term, fit, boundSessionId, terminalId, true);
+          } catch (resizeErr) {
+            const msg = String(resizeErr);
+            // Stale/dead PTY left in backend map — force recreate once.
+            if (!msg.includes("channel closed") && !msg.includes("Terminal channel closed")) {
+              throw resizeErr;
+            }
+            ptyReadyRef.current = false;
+            delete lastPtySizeByKey[`${boundSessionId}:${terminalId}`];
+            await invoke("terminal_destroy", {
+              sessionId: boundSessionId,
+              terminalId,
+            }).catch(() => {});
+            if (isStale()) return;
+            await invoke("terminal_create", {
+              sessionId: boundSessionId,
+              terminalId,
+              options,
+            });
+            if (isStale()) return;
+            ptyReadyRef.current = true;
+            flushPendingInput();
+            await syncPtySize(term, fit, boundSessionId, terminalId, true);
+          }
+        };
+        await ensureSized();
         if (isStale()) return;
         scheduleSizeSync();
 
@@ -451,6 +537,21 @@ export function Terminal({
           sendPtyResize(boundSessionId, terminalId, cols, rows).catch(console.error);
         }).dispose;
 
+        if (!isLocal) {
+          void listen<TerminalClosedEvent>("terminal-closed", (event) => {
+            if (isStale()) return;
+            if (
+              event.payload.sessionId !== boundSessionId ||
+              event.payload.terminalId !== terminalId
+            ) {
+              return;
+            }
+            void recoverPtyRef.current?.("SSH 连接已断开，正在重连…");
+          }).then((fn) => {
+            unlistenClosed = fn;
+          });
+        }
+
         term.focus();
       } catch (e) {
         if (!isStale()) {
@@ -479,6 +580,7 @@ export function Terminal({
       window.removeEventListener("resize", handleLayoutResize);
       onResizeDispose?.();
       onDataDispose?.();
+      unlistenClosed?.();
       term.dispose();
       fitRef.current = null;
       termRef.current = null;

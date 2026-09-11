@@ -1,12 +1,12 @@
 use crate::db::connection::get_connection;
-use crate::ssh::session::connect;
+use crate::ssh::session::{connect, ensure_sftp_alive, reconnect_sftp};
 use crate::ssh::archive_transfer::{
     copy_remote_directory_compressed, download_directory_compressed, path_is_local_dir,
     path_is_remote_dir, upload_directory_compressed,
 };
 use crate::ssh::sftp::{
-    copy_remote_to_remote_with_progress, download_remote_path_with_progress, list_dir,
-    read_file, read_file_bytes, remove_path, rename_path, upload_local_path_with_progress,
+    copy_remote_to_remote_with_progress, download_remote_path_with_progress, is_sftp_transport_error,
+    list_dir, read_file, read_file_bytes, remove_path, rename_path, upload_local_path_with_progress,
     write_file, write_file_bytes,
 };
 use crate::state::AppState;
@@ -14,6 +14,7 @@ use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine as _};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tauri::State;
@@ -116,6 +117,29 @@ async fn get_session(
         .ok_or_else(|| "Session not found".to_string())
 }
 
+async fn with_sftp_retry<T, F, Fut>(
+    session: &crate::ssh::session::SharedSession,
+    op: F,
+) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, anyhow::Error>>,
+{
+    match op().await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let message = err.to_string();
+            if !is_sftp_transport_error(&message) {
+                return Err(message);
+            }
+            reconnect_sftp(session)
+                .await
+                .map_err(|e| format!("SFTP reconnect failed: {e}"))?;
+            op().await.map_err(|e| e.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn connect_ssh(
     state: State<'_, AppState>,
@@ -155,13 +179,24 @@ pub async fn disconnect_ssh(state: State<'_, AppState>, session_id: String) -> R
 }
 
 #[tauri::command]
+pub async fn session_ensure_alive(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let session = get_session(&state, &session_id).await?;
+    ensure_sftp_alive(&session)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn sftp_list_dir(
     state: State<'_, AppState>,
     session_id: String,
     path: String,
 ) -> Result<Vec<crate::ssh::sftp::FileEntry>, String> {
     let session = get_session(&state, &session_id).await?;
-    list_dir(&session, &path).await.map_err(|e| e.to_string())
+    with_sftp_retry(&session, || list_dir(&session, &path)).await
 }
 
 #[tauri::command]
@@ -171,7 +206,7 @@ pub async fn sftp_read_file(
     path: String,
 ) -> Result<String, String> {
     let session = get_session(&state, &session_id).await?;
-    read_file(&session, &path).await.map_err(|e| e.to_string())
+    with_sftp_retry(&session, || read_file(&session, &path)).await
 }
 
 #[tauri::command]
@@ -182,9 +217,7 @@ pub async fn sftp_write_file(
     content: String,
 ) -> Result<(), String> {
     let session = get_session(&state, &session_id).await?;
-    write_file(&session, &path, &content)
-        .await
-        .map_err(|e| e.to_string())
+    with_sftp_retry(&session, || write_file(&session, &path, &content)).await
 }
 
 #[tauri::command]
@@ -194,9 +227,7 @@ pub async fn sftp_read_file_base64(
     path: String,
 ) -> Result<String, String> {
     let session = get_session(&state, &session_id).await?;
-    let bytes = read_file_bytes(&session, &path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let bytes = with_sftp_retry(&session, || read_file_bytes(&session, &path)).await?;
     Ok(general_purpose::STANDARD.encode(bytes))
 }
 
@@ -211,9 +242,7 @@ pub async fn sftp_write_file_base64(
     let bytes = general_purpose::STANDARD
         .decode(content_base64)
         .map_err(|e| format!("Invalid base64 content: {e}"))?;
-    write_file_bytes(&session, &path, &bytes)
-        .await
-        .map_err(|e| e.to_string())
+    with_sftp_retry(&session, || write_file_bytes(&session, &path, &bytes)).await
 }
 
 #[tauri::command]
@@ -225,6 +254,11 @@ pub fn save_local_file_base64(path: String, content_base64: String) -> Result<()
 }
 
 #[tauri::command]
+pub fn read_local_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read local file: {e}"))
+}
+
+#[tauri::command]
 pub async fn sftp_remove_path(
     state: State<'_, AppState>,
     session_id: String,
@@ -232,9 +266,7 @@ pub async fn sftp_remove_path(
     is_dir: bool,
 ) -> Result<(), String> {
     let session = get_session(&state, &session_id).await?;
-    remove_path(&session, &path, is_dir)
-        .await
-        .map_err(|e| e.to_string())
+    with_sftp_retry(&session, || remove_path(&session, &path, is_dir)).await
 }
 
 #[tauri::command]
@@ -245,9 +277,7 @@ pub async fn sftp_rename_path(
     new_path: String,
 ) -> Result<(), String> {
     let session = get_session(&state, &session_id).await?;
-    rename_path(&session, &path, &new_path)
-        .await
-        .map_err(|e| e.to_string())
+    with_sftp_retry(&session, || rename_path(&session, &path, &new_path)).await
 }
 
 #[tauri::command]

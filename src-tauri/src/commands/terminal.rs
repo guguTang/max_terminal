@@ -51,6 +51,13 @@ async fn create_terminal_for_session(
                     && (message.contains("ConnectFailed") || message.contains("open terminal channel"));
                 drop(_io_guard);
                 if should_retry {
+                    // Reconnecting the transport closes every existing shell channel.
+                    // Drop stale handles so later terminal_create/resize don't hit
+                    // "channel closed" on zombie PTYs.
+                    let stale = std::mem::take(&mut inner.terminals);
+                    for (_, terminal) in stale {
+                        terminal.stop().await;
+                    }
                     inner
                         .reconnect_terminal_transport()
                         .await
@@ -122,10 +129,30 @@ pub async fn terminal_create(
         .unwrap_or(false)
         || !options.initial_env.is_empty();
 
+    // Replace dead PTY handles left behind after shell/SSH channel exit.
+    {
+        let dead = {
+            let mut inner = session.lock().await;
+            match inner.terminals.get(&terminal_id) {
+                Some(existing) if existing.is_alive() => {
+                    return Ok(());
+                }
+                Some(_) => inner.terminals.remove(&terminal_id),
+                None => None,
+            }
+        };
+        if let Some(dead) = dead {
+            dead.stop().await;
+        }
+    }
+
     let terminal = {
         let mut inner = session.lock().await;
-        if inner.terminals.contains_key(&terminal_id) {
-            return Ok(());
+        if let Some(existing) = inner.terminals.get(&terminal_id) {
+            if existing.is_alive() {
+                return Ok(());
+            }
+            inner.terminals.remove(&terminal_id);
         }
 
         let meta_cwd = options

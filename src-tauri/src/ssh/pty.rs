@@ -143,6 +143,10 @@ pub struct TerminalHandle {
 }
 
 impl TerminalHandle {
+    pub fn is_alive(&self) -> bool {
+        !self.reader.is_finished()
+    }
+
     pub async fn stop(&self) {
         let _ = self.shutdown_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(2), async {
@@ -253,6 +257,13 @@ pub struct TerminalOutputEvent {
     pub data: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalClosedEvent {
+    pub session_id: String,
+    pub terminal_id: String,
+}
+
 pub async fn create_terminal(
     handle: &mut client::Handle<SshHandler>,
     app: AppHandle,
@@ -300,6 +311,7 @@ pub async fn create_terminal(
 
     let reader = tokio::spawn(async move {
         let mut channel = channel;
+        let mut unexpected_close = false;
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -311,6 +323,7 @@ pub async fn create_terminal(
                     match data {
                         Some(bytes) => {
                             if channel.data(&bytes[..]).await.is_err() {
+                                unexpected_close = true;
                                 break;
                             }
                         }
@@ -349,11 +362,23 @@ pub async fn create_terminal(
                                 );
                             }
                         }
-                        Some(ChannelMsg::ExitStatus { .. }) | None => break,
+                        Some(ChannelMsg::ExitStatus { .. }) | None => {
+                            unexpected_close = true;
+                            break;
+                        }
                         _ => {}
                     }
                 }
             }
+        }
+        if unexpected_close {
+            let _ = app.emit(
+                "terminal-closed",
+                TerminalClosedEvent {
+                    session_id: reader_session_id,
+                    terminal_id: reader_terminal_id,
+                },
+            );
         }
     });
 
@@ -368,6 +393,9 @@ pub async fn create_terminal(
 }
 
 pub async fn write_input(terminal: &TerminalHandle, data: &str) -> Result<()> {
+    if !terminal.is_alive() {
+        return Err(anyhow!("Terminal channel closed"));
+    }
     terminal
         .stdin_tx
         .send(data.as_bytes().to_vec())
@@ -375,6 +403,9 @@ pub async fn write_input(terminal: &TerminalHandle, data: &str) -> Result<()> {
 }
 
 pub async fn resize_terminal(terminal: &TerminalHandle, cols: u32, rows: u32) -> Result<()> {
+    if !terminal.is_alive() {
+        return Err(anyhow!("Terminal channel closed"));
+    }
     terminal
         .resize_tx
         .send((cols, rows))

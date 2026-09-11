@@ -10,10 +10,10 @@ use commands::connection::{
 };
 use commands::docker::{docker_list_containers, docker_list_images};
 use commands::sftp::{
-    connect_ssh, disconnect_ssh, sftp_list_dir, sftp_read_file, sftp_read_file_base64,
-    sftp_remove_path, sftp_rename_path, sftp_write_file, sftp_write_file_base64,
-    save_local_file_base64, transfer_cancel, transfer_query, transfer_start_download,
-    transfer_start_remote_copy, transfer_start_upload,
+    connect_ssh, disconnect_ssh, session_ensure_alive, sftp_list_dir, sftp_read_file,
+    sftp_read_file_base64, sftp_remove_path, sftp_rename_path, sftp_write_file,
+    sftp_write_file_base64, save_local_file_base64, read_local_text_file, transfer_cancel, transfer_query,
+    transfer_start_download, transfer_start_remote_copy, transfer_start_upload,
 };
 use commands::terminal::{
     terminal_apply_state, terminal_create, terminal_destroy, terminal_destroy_all_local,
@@ -50,12 +50,14 @@ pub fn run() {
             test_connection_cmd,
             connect_ssh,
             disconnect_ssh,
+            session_ensure_alive,
             sftp_list_dir,
             sftp_read_file,
             sftp_read_file_base64,
             sftp_write_file,
             sftp_write_file_base64,
             save_local_file_base64,
+            read_local_text_file,
             sftp_remove_path,
             sftp_rename_path,
             transfer_start_upload,

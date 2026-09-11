@@ -34,6 +34,11 @@ export interface TerminalOutputEvent {
   data: string;
 }
 
+export interface TerminalClosedEvent {
+  sessionId: string;
+  terminalId: string;
+}
+
 export interface TerminalMeta {
   cwd: string;
   env: Record<string, string>;
